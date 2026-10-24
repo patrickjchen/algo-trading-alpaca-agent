@@ -1,0 +1,23 @@
+You are generating: webgui.py — thin Flask backend for web/index.html (which you receive as a prior; match its API contract exactly). NO inline HTML. Routes read Redis + SQLite and forward writes to OMS/EMS via `runtime.send_command`. ≤ 400 lines.
+
+REQUIREMENTS
+- `app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="/static")`, `WEB_DIR = Path(__file__).parent / "web"`. Route decorators at module level are fine; `app.run` only inside `main()` under `if __name__ == "__main__"`. `main()` = `runtime.run_forever(body, "webgui")` where body runs `app.run(host=WEBGUI_HOST default 127.0.0.1, port=WEBGUI_PORT default 5000, debug=False, threaded=True, use_reloader=False)`.
+- Redis: a module-level lazy accessor `_r()` creating `runtime.get_redis()` on first use (no connection at import). SQLite: `runtime.sqlite_connect()` per request, read-only queries, close after; `sqlite3.OperationalError` → empty results. Silence werkzeug access log (`logging.getLogger("werkzeug").setLevel(logging.WARNING)`); `after_request` throttled 60 s summary via `runtime.log("webgui")`.
+- Helpers: `_live(arg) -> bool` ("1","true","yes"); `_account(live) -> "live"|"paper"`; `_rows(sql, params) -> list[dict]`; `_json_err(msg, code)`.
+- ROUTES (exact rule strings; the verifier checks `app.url_map`):
+  `GET /` → `send_from_directory(WEB_DIR, "index.html")` or a 200 text hint if missing.
+  `GET /api/health` → workers = {name: runtime.worker_alive(r, name) for subscriber, trade_stream, oms, ems, webgui} → `{alive: bool, age_s: seconds since its ts or None}`; `redis` = ping ok; `db` = DB file exists and `SELECT 1 FROM orders LIMIT 1` works (or table missing → False); `last_reconcile` = GET alpaca:oms:last_reconcile; `ok` = redis and oms alive. Never 500.
+  `GET /api/symbols` → sorted SMEMBERS, [] on error.
+  `GET /api/orderbook/<path:symbol>` → from `alpaca:ob:bids/asks:<SYM>` hashes (floats, skip ≤0, sort bids desc / asks asc, top 10) + `timestamp` from `alpaca:orderbook:<SYM>`; fallback `alpaca:latest:<SYM>` 1-level book with `fallback:"quote_only"`; else `fallback:"no_data"`.
+  `GET /api/latest/<path:symbol>` → HGETALL or {}.
+  `GET /api/orders` (args limit≤500 default 50, status all|open|closed → open = status IN ACTIVE_STATUSES, closed = NOT IN; account paper|live|all default all) → ORDER BY submitted_at DESC.
+  `GET /api/fills` (limit) → ORDER BY ts DESC.
+  `GET /api/summary` (live) → `trader.account/positions` in try/except (→ None + `degraded: True`); `realized_pnl_by_symbol` computed FIFO per symbol from `fills` of that account (`JOIN orders USING(order_id)` on account): buys open lots, sells close FIFO; realized = Σ (sell_px − lot_px)·qty; unmatched sells (short) ignored. Never 500.
+  `POST /api/order` → validate body (symbol, qty>0, side buy|sell, type market|limit, limit_price>0 if limit, tif gtc|ioc default gtc, live bool) else 400; `account=_account(live)`; if not `runtime.worker_alive(r,"oms")` → 503 `{ok False, error:"OMS not running"}`; payload `{kind:"submit", account, client_order_id: runtime.new_client_order_id("tc"), symbol, side, type, qty, limit_price, tif, source:"webgui"}`; reply = `runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload, timeout=12)`; HTTP 200 if reply.ok else 502 (timeout → 504). Return the reply dict.
+  `DELETE /api/order/<order_id>` (live arg) → OMS cancel command; same status mapping.
+  `GET /api/algos/strategies` → `algos.available_strategies()`.
+  `POST /api/algo` → validate (strategy in REGISTRY & available, symbol, side, total_qty>0, duration_s≥10, n_slices≥1, optional limit_cap>0, params dict, live) else 400; 503 if EMS heartbeat missing; `runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, {kind:"create", strategy, account, symbol, side, total_qty, duration_s, n_slices, limit_cap, params, source:"webgui"}, timeout=12)`.
+  `GET /api/algos` (status running|all default all; limit 100) → algo_orders rows + `slices_done` (slices with status in filled/rolled/cancelled/failed) and `slices_total` via subqueries, ORDER BY created_at DESC.
+  `GET /api/algo/<algo_id>` → `{algo, slices, orders}` (404 JSON if unknown).
+  `DELETE /api/algo/<algo_id>` → EMS cancel request.
+- Import `trader`, `algos`, `runtime` (flat imports, same dir). No network at import. Call `mcp__verify__verify_stage(stage="webgui")`.

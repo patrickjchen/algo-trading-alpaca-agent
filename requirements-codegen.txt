@@ -1,0 +1,2 @@
+# Only needed to run claude_codegen.py (the generator), not the pipeline.
+claude-agent-sdk>=0.2.170
