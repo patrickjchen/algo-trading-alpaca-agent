@@ -36,7 +36,7 @@ Costs: Opus 5.5, ≤$6 per agent call by default (`--budget`), ~12 stages per fu
 Logs: `.codegen_logs/run-*.jsonl`; last-good backups `.codegen_backup/`; failed attempts `.codegen_failed/`.
 
 Runtime (paper by default): `cp run.bash.example run.bash`, fill keys, `source run.bash`,
-start Redis, `scripts/run_all.sh` (5 workers: subscriber, trade_stream, oms, ems, webgui;
+start Redis, `scripts/run_all.sh` (4 processes: subscriber, trade_stream, oms_ems, webgui;
 UI on http://127.0.0.1:5000). `cd generated && python cli.py health|symbols|buy|twap ...`.
 Only one TradingStream per Alpaca account: do not run `../TradingWithAlpaca` workers concurrently.
 
@@ -47,6 +47,9 @@ Only one TradingStream per Alpaca account: do not run `../TradingWithAlpaca` wor
   on `alpaca:reply:<cmd_id>` (`runtime.send_command`). Idempotent on `client_order_id`.
   Consumer-group reads drain the pending list first and XAUTOCLAIM stale entries; failures go to
   `alpaca:trade_updates:dlq`. REST reconciliation at start and every 30 s.
+- **oms_ems** (`oms_ems.py`) hosts `oms.body` and `ems.body` as two supervised daemon threads in one
+  process (each via `runtime.run_forever`, so both `alpaca:heartbeat:oms` and `:ems` are still written).
+  `oms.py` / `ems.py` remain runnable standalone; `run_all.sh` launches `oms_ems` instead of both.
 - **EMS** (`ems.py`) owns `algo_orders, algo_slices`; schedules are persisted so a restart resumes.
   TWAP children are limit-at-touch GTC, rolled forward at the next slice, final slice IOC crossing
   by `cross_bps`, always clamped to `limit_cap`. VWAP/IS are registered stubs (GUI shows them disabled).

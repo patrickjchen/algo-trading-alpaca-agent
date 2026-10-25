@@ -33,7 +33,7 @@ python claude_codegen.py --stage all    # regenerate everything
 ```bash
 cp run.bash.example run.bash && $EDITOR run.bash && source run.bash
 docker run -d -p 6379:6379 redis
-scripts/run_all.sh                      # subscriber, trade_stream, oms, ems, webgui -> http://127.0.0.1:5000
+scripts/run_all.sh                      # subscriber, trade_stream, oms_ems (OMS+EMS in one process), webgui -> http://127.0.0.1:5000
 cd generated && python cli.py health && python cli.py twap BTC/USD buy 0.0002 --duration 60 --slices 2
 python -m pytest -q generated/tests -m "not live"     # offline
 python -m pytest -q generated/tests -m live           # needs creds + Redis + workers

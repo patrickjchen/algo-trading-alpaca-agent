@@ -32,6 +32,7 @@ Flask `url_map` rules (webgui) / required substrings (HTML) / `pytest` (test sta
  webgui.py / cli.py ── XADD alpaca:ems:requests ──► ems.py ──► SQLite algo_orders/algo_slices
                                                       └── child submits/cancels ──► alpaca:oms:commands
  every worker ──► alpaca:heartbeat:<name> (EX 15) ──► webgui /api/health, cli health, live tests
+ oms_ems.py ──► runs oms.body + ems.body as two supervised threads in one process (both heartbeats kept)
 ```
 
 ### Submit path (sequence)
