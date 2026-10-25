@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Copy to run.bash (gitignored) and fill in your Alpaca PAPER keys.
+export ALPACA_API_KEY_ID=PK...
+export ALPACA_API_SECRET_KEY=...
+export REDIS_URL=redis://localhost:6379/0
+export ALPACA_DB_PATH=./alpaca.db
+# docker run -d -p 6379:6379 redis
+exec scripts/run_all.sh

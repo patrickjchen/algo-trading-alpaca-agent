@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+run.bash
+.codegen_backup/
+.codegen_failed/
+.codegen_logs/
+
+# secrets / local state (never commit)
+ANTHROPIC_API_KEY_file
+api_keys
+*_keys
+*.key
+.logs/
+simple.bash

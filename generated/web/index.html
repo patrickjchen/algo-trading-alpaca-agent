@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading With Claude</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --border: #2a313b;
+    --text: #d7dde5; --muted: #7d8794; --green: #2ecc71; --red: #e74c3c;
+    --amber: #f0ad4e; --blue: #4aa3ff; --ask-bg: rgba(231,76,60,0.12); --bid-bg: rgba(46,204,113,0.12);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 17px; margin: 0 12px 0 0; font-weight: 600; }
+  select, input, button { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font: inherit; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .health { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-left: auto; }
+  .pill { padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+  .pill.up { background: rgba(46,204,113,0.18); color: var(--green); border-color: rgba(46,204,113,0.5); }
+  .pill.down { background: rgba(231,76,60,0.18); color: var(--red); border-color: rgba(231,76,60,0.5); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; background: var(--muted); }
+  .dot.up { background: var(--green); } .dot.down { background: var(--red); }
+  .dotlabel { font-size: 11px; color: var(--muted); }
+  nav { display: flex; gap: 4px; padding: 8px 16px 0; background: var(--bg); }
+  nav button { border-radius: 4px 4px 0 0; border-bottom: none; padding: 6px 14px; }
+  nav button.active { background: var(--panel); border-color: var(--blue); color: #fff; }
+  .tab { display: none; padding: 14px 16px; background: var(--panel); border-top: 1px solid var(--border); min-height: 70vh; }
+  .tab.active { display: block; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 8px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  td.num, th.num { text-align: right; }
+  .muted { color: var(--muted); }
+  .buy { color: var(--green); } .sell { color: var(--red); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  h3 { margin: 16px 0 8px; font-size: 14px; font-weight: 600; }
+  .ladder { width: 420px; max-width: 100%; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .ladder .row { display: grid; grid-template-columns: 1fr 1fr; padding: 3px 10px; height: 22px; font-variant-numeric: tabular-nums; }
+  .ladder .row.ask { background: var(--ask-bg); color: #f19a90; cursor: pointer; }
+  .ladder .row.bid { background: var(--bid-bg); color: #8fe0b0; cursor: pointer; }
+  .ladder .row.ask:hover, .ladder .row.bid:hover { outline: 1px solid var(--blue); }
+  .ladder .row.empty { background: transparent; cursor: default; }
+  .ladder .row .sz { text-align: right; }
+  .ladder .spread { padding: 4px 10px; text-align: center; color: var(--amber); background: var(--panel2); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .ladder .hdr { display: grid; grid-template-columns: 1fr 1fr; padding: 3px 10px; color: var(--muted); font-size: 11px; }
+  .ladder .hdr span:last-child { text-align: right; }
+  .meta { margin-top: 8px; color: var(--muted); font-size: 12px; }
+  .tag { display: inline-block; padding: 0 6px; border-radius: 3px; background: rgba(240,173,78,0.2); color: var(--amber); margin-left: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .card { background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; }
+  .card .k { color: var(--muted); font-size: 11px; } .card .v { font-size: 16px; margin-top: 2px; }
+  .progress { position: relative; width: 140px; height: 16px; background: var(--panel2); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  .progress .bar { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(74,163,255,0.45); }
+  .progress .txt { position: relative; font-size: 11px; text-align: center; line-height: 14px; }
+  .st-running, .st-pending { color: var(--blue); } .st-completed, .st-filled { color: var(--green); }
+  .st-canceled, .st-cancelled, .st-expired { color: var(--muted); } .st-error, .st-failed, .st-rejected { color: var(--red); }
+  .st-partially_filled, .st-new, .st-accepted, .st-pending_new { color: var(--amber); }
+  tr.clickable { cursor: pointer; } tr.clickable:hover td { background: rgba(74,163,255,0.06); }
+  tr.detail > td { background: var(--panel2); padding: 8px 16px; }
+  .form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; padding: 10px; background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; }
+  .form label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
+  .form input[type=number] { width: 110px; }
+  .modal-back { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 50; }
+  .modal-back.open { display: block; }
+  #order-modal { position: absolute; top: 90px; left: 50%; transform: translateX(-50%); width: 340px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; z-index: 60; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+  #order-modal h2 { margin: 0 0 10px; font-size: 15px; }
+  #order-modal .fld { display: flex; justify-content: space-between; align-items: center; margin: 7px 0; gap: 10px; }
+  #order-modal .fld > span:first-child { color: var(--muted); }
+  #order-modal input[type=number], #order-modal input[type=text] { width: 160px; }
+  #order-modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .hidden { display: none !important; }
+  #toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 6px; z-index: 100; }
+  .toast { padding: 8px 12px; border-radius: 4px; max-width: 380px; word-break: break-word; box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+  .toast.ok { background: #1d4d33; border: 1px solid var(--green); }
+  .toast.err { background: #5a1f1a; border: 1px solid var(--red); }
+  .note { color: var(--muted); font-style: italic; margin: 6px 0; }
+  .scroll { max-height: 45vh; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Trading With Claude</h1>
+  <label class="muted">Symbol
+    <select id="global-symbol"><option value="">(no symbols streaming)</option></select>
+  </label>
+  <button id="btn-refresh" type="button">Refresh</button>
+  <div class="health" id="health-strip"></div>
+</header>
+
+<nav>
+  <button id="btn-escalator" type="button" class="active">Escalator</button>
+  <button id="btn-activity" type="button">Activity</button>
+  <button id="btn-summary" type="button">Summary</button>
+  <button id="btn-algos" type="button">Algos</button>
+</nav>
+
+<section id="tab-escalator" class="tab active">
+  <div class="ladder" id="ladder"></div>
+  <div class="meta" id="ladder-meta">waiting for orderbook...</div>
+  <div class="note">Click an ask row to BUY at that price, a bid row to SELL.</div>
+</section>
+
+<section id="tab-activity" class="tab">
+  <div class="toolbar">
+    <button id="act-refresh" type="button">Refresh</button>
+    <label class="muted">Status
+      <select id="act-status"><option value="all">all</option><option value="open">open</option><option value="closed">closed</option></select>
+    </label>
+    <label class="muted">Account
+      <select id="act-account"><option value="paper">paper</option><option value="live">live</option></select>
+    </label>
+    <span class="muted" id="act-msg"></span>
+  </div>
+  <h3>Orders</h3>
+  <div class="scroll">
+  <table id="orders-table">
+    <thead><tr>
+      <th>submitted_at</th><th>order_id</th><th>account</th><th>symbol</th><th>side</th><th>type</th>
+      <th class="num">Limit ($)</th><th class="num">qty</th><th class="num">filled_qty</th><th class="num">Avg Px ($)</th>
+      <th class="num">Notional ($)</th><th>status</th><th>source</th><th>algo</th><th>action</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <h3>Fills</h3>
+  <div class="scroll">
+  <table id="fills-table">
+    <thead><tr>
+      <th>ts</th><th>order_id</th><th>symbol</th><th>side</th><th class="num">qty</th><th class="num">Price ($)</th>
+      <th class="num">Notional ($)</th><th>event</th><th>algo</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+</section>
+
+<section id="tab-summary" class="tab">
+  <div class="toolbar">
+    <label><input type="checkbox" id="sum-live"> Live</label>
+    <button id="sum-refresh" type="button">Refresh</button>
+    <span class="muted" id="sum-account-label"></span>
+  </div>
+  <div class="note hidden" id="sum-degraded">account data unavailable (no credentials or Alpaca unreachable)</div>
+  <div class="grid" id="sum-grid"></div>
+  <h3>Positions</h3>
+  <table id="pos-table">
+    <thead><tr>
+      <th>symbol</th><th class="num">qty</th><th class="num">avg_entry_price</th><th class="num">current_price</th>
+      <th class="num">market_value</th><th class="num">unrealized_pl</th><th class="num">unrealized_plpc</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <h3>Realized PnL</h3>
+  <table id="pnl-table">
+    <thead><tr><th>symbol</th><th class="num">realized_pnl ($)</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="tab-algos" class="tab">
+  <h3>New algo</h3>
+  <div class="form">
+    <label>Strategy <select id="algo-strategy"><option value="twap">TWAP</option></select></label>
+    <label>Symbol <input type="text" id="algo-symbol" size="10"></label>
+    <label>Side <select id="algo-side"><option value="buy">buy</option><option value="sell">sell</option></select></label>
+    <label>Total qty <input type="number" id="algo-qty" step="any" min="0"></label>
+    <label>Duration (s) <input type="number" id="algo-duration" step="1" min="1" value="300"></label>
+    <label>Slices <input type="number" id="algo-slices" step="1" min="1" value="5"></label>
+    <label>Limit cap (optional) <input type="number" id="algo-cap" step="any" min="0"></label>
+    <label>Live <input type="checkbox" id="algo-live"></label>
+    <button id="algo-submit" type="button">Start algo</button>
+  </div>
+  <div class="note" id="algo-strategy-note"></div>
+  <div class="toolbar" style="margin-top:12px">
+    <label class="muted">Show
+      <select id="algo-filter"><option value="all">all</option><option value="running">running</option></select>
+    </label>
+    <button id="algo-refresh" type="button">Refresh</button>
+  </div>
+  <table id="algos-table">
+    <thead><tr>
+      <th>created_at</th><th>algo_id</th><th>strategy</th><th>account</th><th>symbol</th><th>side</th>
+      <th>progress</th><th>slices</th><th class="num">avg_px</th><th>status</th><th>action</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<div class="modal-back" id="modal-back">
+  <div id="order-modal" role="dialog" aria-modal="true">
+    <h2 id="m-title">New order</h2>
+    <div class="fld"><span>Symbol</span><input type="text" id="m-symbol" readonly></div>
+    <div class="fld"><span>Side</span><input type="text" id="m-side" readonly></div>
+    <div class="fld"><span>Type</span>
+      <span>
+        <label><input type="radio" name="m-type" value="market"> market</label>
+        <label><input type="radio" name="m-type" value="limit" checked> limit</label>
+        <label><input type="radio" name="m-type" value="algo"> algo</label>
+      </span>
+    </div>
+    <div class="fld" id="m-limit-row"><span>Limit price</span><input type="number" id="m-limit" step="any" min="0"></div>
+    <div id="m-algo-rows" class="hidden">
+      <div class="fld"><span>Duration (s)</span><input type="number" id="m-duration" step="1" min="1" value="300"></div>
+      <div class="fld"><span>Slices</span><input type="number" id="m-slices" step="1" min="1" value="5"></div>
+      <div class="fld"><span>Limit cap</span><input type="number" id="m-cap" step="any" min="0"></div>
+    </div>
+    <div class="fld"><span>Qty</span><input type="number" id="m-qty" step="any" min="0"></div>
+    <div class="fld" id="m-tif-row"><span>TIF</span><select id="m-tif"><option value="gtc">gtc</option><option value="ioc">ioc</option></select></div>
+    <div class="fld"><span>Live</span><input type="checkbox" id="m-live"></div>
+    <div class="actions">
+      <button type="button" id="m-cancel">Cancel</button>
+      <button type="button" id="m-submit">Submit</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+(function () {
+  "use strict";
+  var WORKERS = ["subscriber", "trade_stream", "oms", "ems", "webgui"];
+  var TABS = ["escalator", "activity", "summary", "algos"];
+  var ACTIVE = { "new": 1, "accepted": 1, "pending_new": 1, "partially_filled": 1, "pending_cancel": 1, "pending_replace": 1 };
+  var state = { tab: "escalator", poll: null, symbol: "", expanded: {}, details: {}, strategies: [] };
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
+  function num(x) {
+    if (x === null || x === undefined || x === "") return null;
+    var n = typeof x === "number" ? x : parseFloat(x);
+    return isFinite(n) ? n : null;
+  }
+  function fmt2(x) { var n = num(x); return n === null ? "" : n.toFixed(2); }
+  function fmtQty(x) {
+    var n = num(x); if (n === null) return "";
+    return String(parseFloat(n.toFixed(8)));
+  }
+  function fmtPx(x) {
+    var n = num(x); if (n === null) return "";
+    var a = Math.abs(n);
+    return n.toFixed(a >= 1000 ? 2 : a >= 1 ? 4 : 6);
+  }
+  function str(x) { return x === null || x === undefined ? "" : String(x); }
+  function short(x, n) { var s = str(x); return s.length > (n || 8) ? s.slice(0, n || 8) : s; }
+  function fmtTs(x) {
+    var s = str(x); if (!s) return "";
+    return s.replace("T", " ").replace(/\.\d+/, "").replace(/\+00:00$|Z$/, "");
+  }
+  function mul(a, b) { var x = num(a), y = num(b); return x === null || y === null ? null : x * y; }
+  function td(text, cls, title) {
+    var c = el("td", cls || "", text);
+    if (title) c.title = title;
+    return c;
+  }
+  function placeholderRow(tbody, cols, text) {
+    var tr = el("tr"); var c = el("td", "muted", text); c.colSpan = cols; tr.appendChild(c); tbody.appendChild(tr);
+  }
+
+  function api(method, url, body) {
+    var opts = { method: method, headers: {} };
+    if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    return fetch(url, opts).then(function (resp) {
+      return resp.text().then(function (t) {
+        var data = null;
+        try { data = t ? JSON.parse(t) : null; } catch (e) { data = { ok: false, error: t ? t.slice(0, 200) : "invalid response" }; }
+        return { status: resp.status, ok: resp.ok, data: data };
+      });
+    }).catch(function (e) {
+      return { status: 0, ok: false, data: { ok: false, error: "network error: " + (e && e.message ? e.message : e) } };
+    });
+  }
+
+  function toast(msg, ok) {
+    var t = el("div", "toast " + (ok ? "ok" : "err"), msg);
+    $("toasts").appendChild(t);
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, ok ? 4000 : 7000);
+  }
+  function replyToast(res, what) {
+    var d = res.data || {};
+    var good = res.ok && d.ok !== false;
+    var parts = [what + ": " + (str(d.status) || (good ? "ok" : "failed"))];
+    if (d.algo_id) parts.push("algo " + short(d.algo_id, 8));
+    var oid = d.order_id || (d.order && (d.order.order_id || d.order.id));
+    if (oid) parts.push("order " + short(oid, 8));
+    if (d.error) parts.push(str(d.error));
+    if (!good && res.status) parts.push("(HTTP " + res.status + ")");
+    toast(parts.join(" - "), good);
+    return good;
+  }
+
+  /* ---------- health ---------- */
+  function renderHealth(h) {
+    var strip = $("health-strip"); clear(strip);
+    h = h || {};
+    var workers = h.workers || {};
+    WORKERS.forEach(function (w) {
+      var info = workers[w] || {};
+      var alive = !!info.alive;
+      var p = el("span", "pill " + (alive ? "up" : "down"), alive ? w : w + " down");
+      var age = num(info.age_s);
+      p.title = w + (age !== null ? " heartbeat " + age.toFixed(1) + "s ago" : " no heartbeat");
+      strip.appendChild(p);
+    });
+    [["redis", h.redis], ["db", h.db]].forEach(function (pair) {
+      var s = el("span", "dotlabel");
+      s.appendChild(el("span", "dot " + (pair[1] ? "up" : "down")));
+      s.appendChild(document.createTextNode(pair[0]));
+      strip.appendChild(s);
+    });
+    if (h.last_reconcile) {
+      var r = el("span", "dotlabel", "reconciled " + fmtTs(h.last_reconcile));
+      strip.appendChild(r);
+    }
+  }
+  function pollHealth() {
+    api("GET", "/api/health").then(function (res) { renderHealth(res.data); });
+  }
+
+  /* ---------- symbols ---------- */
+  function loadSymbols() {
+    return api("GET", "/api/symbols").then(function (res) {
+      var list = Array.isArray(res.data) ? res.data.filter(function (s) { return typeof s === "string" && s; }) : [];
+      var sel = $("global-symbol"); var prev = state.symbol || sel.value;
+      clear(sel);
+      if (!list.length) {
+        var o = el("option", "", "(no symbols streaming)"); o.value = ""; sel.appendChild(o);
+        state.symbol = "";
+      } else {
+        list.forEach(function (s) { var o = el("option", "", s); o.value = s; sel.appendChild(o); });
+        state.symbol = list.indexOf(prev) >= 0 ? prev : list[0];
+        sel.value = state.symbol;
+      }
+      if (!$("algo-symbol").value) $("algo-symbol").value = state.symbol;
+    });
+  }
+
+  /* ---------- escalator ---------- */
+  function ladderRow(kind, lvl) {
+    var price = lvl ? num(lvl.price) : null, size = lvl ? num(lvl.size) : null;
+    if (price === null) {
+      var e = el("div", "row empty"); e.appendChild(el("span", "", "")); e.appendChild(el("span", "sz", "")); return e;
+    }
+    var r = el("div", "row " + kind);
+    r.appendChild(el("span", "", fmtPx(price)));
+    r.appendChild(el("span", "sz", size === null ? "" : fmtQty(size)));
+    r.title = (kind === "ask" ? "BUY at " : "SELL at ") + fmtPx(price);
+    r.addEventListener("click", function () { openModal(kind === "ask" ? "buy" : "sell", price); });
+    return r;
+  }
+  function renderLadder(book) {
+    var lad = $("ladder"); clear(lad);
+    book = book || {};
+    var asks = Array.isArray(book.asks) ? book.asks.filter(function (l) { return l && num(l.price) !== null; }).slice(0, 10) : [];
+    var bids = Array.isArray(book.bids) ? book.bids.filter(function (l) { return l && num(l.price) !== null; }).slice(0, 10) : [];
+    var hdr = el("div", "hdr"); hdr.appendChild(el("span", "", "price")); hdr.appendChild(el("span", "", "size")); lad.appendChild(hdr);
+    var i;
+    for (i = 0; i < 10 - asks.length; i++) lad.appendChild(ladderRow("ask", null));
+    for (i = asks.length - 1; i >= 0; i--) lad.appendChild(ladderRow("ask", asks[i]));
+    var sp = "spread -";
+    if (asks.length && bids.length) {
+      var a = num(asks[0].price), b = num(bids[0].price);
+      var spread = a - b, mid = (a + b) / 2;
+      var bps = mid > 0 ? (spread / mid) * 10000 : null;
+      sp = "spread " + fmtPx(spread) + (bps !== null ? " (" + bps.toFixed(2) + " bps)" : "");
+    }
+    lad.appendChild(el("div", "spread", sp));
+    for (i = 0; i < 10; i++) lad.appendChild(ladderRow("bid", bids[i] || null));
+    var meta = $("ladder-meta"); clear(meta);
+    meta.appendChild(document.createTextNode((book.symbol || state.symbol || "no symbol") + "  " + (book.timestamp ? fmtTs(book.timestamp) : "no timestamp")));
+    if (book.fallback) meta.appendChild(el("span", "tag", typeof book.fallback === "string" ? book.fallback : "fallback"));
+    if (!asks.length && !bids.length) meta.appendChild(el("span", "tag", "no book data"));
+  }
+  function pollOrderbook() {
+    if (!state.symbol) { renderLadder({}); return; }
+    var sym = state.symbol;
+    api("GET", "/api/orderbook/" + encodeURIComponent(sym)).then(function (res) {
+      if (sym !== state.symbol) return;
+      renderLadder(res.data && typeof res.data === "object" ? res.data : {});
+    });
+  }
+
+  /* ---------- activity ---------- */
+  function renderOrders(rows) {
+    var tb = $("orders-table").tBodies[0]; clear(tb);
+    if (!rows.length) { placeholderRow(tb, 15, "no orders"); return; }
+    rows.forEach(function (o) {
+      if (!o) return;
+      var tr = el("tr");
+      tr.appendChild(td(fmtTs(o.submitted_at)));
+      tr.appendChild(td(short(o.order_id, 8), "", str(o.order_id) + (o.client_order_id ? " / " + o.client_order_id : "")));
+      tr.appendChild(td(str(o.account)));
+      tr.appendChild(td(str(o.symbol)));
+      tr.appendChild(td(str(o.side), o.side === "buy" ? "buy" : o.side === "sell" ? "sell" : ""));
+      tr.appendChild(td(str(o.type)));
+      tr.appendChild(td(fmt2(o.limit_price), "num"));
+      tr.appendChild(td(fmtQty(o.qty), "num"));
+      tr.appendChild(td(fmtQty(o.filled_qty), "num"));
+      tr.appendChild(td(fmt2(o.filled_avg_price), "num"));
+      tr.appendChild(td(fmt2(mul(o.filled_qty, o.filled_avg_price)), "num"));
+      tr.appendChild(td(str(o.status), "st-" + str(o.status)));
+      tr.appendChild(td(str(o.source)));
+      tr.appendChild(td(o.algo_id ? short(o.algo_id, 8) + (o.slice_idx !== null && o.slice_idx !== undefined ? " #" + o.slice_idx : "") : "", "", str(o.algo_id)));
+      var act = el("td");
+      if (ACTIVE[str(o.status)] && o.order_id) {
+        var b = el("button", "", "Cancel");
+        b.addEventListener("click", function () { cancelOrder(o, b); });
+        act.appendChild(b);
+      }
+      tr.appendChild(act);
+      tb.appendChild(tr);
+    });
+  }
+  function cancelOrder(o, btn) {
+    var live = o.account === "live";
+    if (live && !confirm("Cancel LIVE order " + short(o.order_id, 8) + "?")) return;
+    btn.disabled = true;
+    api("DELETE", "/api/order/" + encodeURIComponent(o.order_id) + "?live=" + (live ? 1 : 0)).then(function (res) {
+      replyToast(res, "cancel");
+      pollActivity();
+    });
+  }
+  function renderFills(rows) {
+    var tb = $("fills-table").tBodies[0]; clear(tb);
+    if (!rows.length) { placeholderRow(tb, 9, "no fills"); return; }
+    rows.forEach(function (f) {
+      if (!f) return;
+      var tr = el("tr");
+      tr.appendChild(td(fmtTs(f.ts)));
+      tr.appendChild(td(short(f.order_id, 8), "", str(f.order_id)));
+      tr.appendChild(td(str(f.symbol)));
+      tr.appendChild(td(str(f.side), f.side === "buy" ? "buy" : f.side === "sell" ? "sell" : ""));
+      tr.appendChild(td(fmtQty(f.qty), "num"));
+      tr.appendChild(td(fmt2(f.price), "num"));
+      tr.appendChild(td(fmt2(mul(f.qty, f.price)), "num"));
+      tr.appendChild(td(str(f.event)));
+      tr.appendChild(td(short(f.algo_id, 8), "", str(f.algo_id)));
+      tb.appendChild(tr);
+    });
+  }
+  function pollActivity() {
+    var q = "?limit=200&status=" + encodeURIComponent($("act-status").value) + "&account=" + encodeURIComponent($("act-account").value);
+    api("GET", "/api/orders" + q).then(function (res) {
+      renderOrders(Array.isArray(res.data) ? res.data : []);
+      $("act-msg").textContent = res.ok ? "" : "orders unavailable" + (res.data && res.data.error ? ": " + res.data.error : "");
+    });
+    api("GET", "/api/fills?limit=200").then(function (res) {
+      renderFills(Array.isArray(res.data) ? res.data : []);
+    });
+  }
+
+  /* ---------- summary ---------- */
+  function pollSummary() {
+    var live = $("sum-live").checked;
+    api("GET", "/api/summary?live=" + (live ? 1 : 0)).then(function (res) {
+      var d = res.data && typeof res.data === "object" ? res.data : {};
+      var acct = d.account && typeof d.account === "object" ? d.account : {};
+      $("sum-degraded").classList.toggle("hidden", !(d.degraded || !res.ok));
+      $("sum-account-label").textContent = live ? "account: live" : "account: paper";
+      var grid = $("sum-grid"); clear(grid);
+      ["equity", "cash", "buying_power", "portfolio_value"].forEach(function (k) {
+        var c = el("div", "card");
+        c.appendChild(el("div", "k", k));
+        var v = fmt2(acct[k]);
+        c.appendChild(el("div", "v", v === "" ? "-" : "$" + v));
+        grid.appendChild(c);
+      });
+      var tb = $("pos-table").tBodies[0]; clear(tb);
+      var pos = Array.isArray(d.positions) ? d.positions : [];
+      if (!pos.length) placeholderRow(tb, 7, "no positions");
+      pos.forEach(function (p) {
+        if (!p) return;
+        var tr = el("tr");
+        tr.appendChild(td(str(p.symbol)));
+        tr.appendChild(td(fmtQty(p.qty), "num"));
+        tr.appendChild(td(fmt2(p.avg_entry_price), "num"));
+        tr.appendChild(td(fmt2(p.current_price), "num"));
+        tr.appendChild(td(fmt2(p.market_value), "num"));
+        var upl = num(p.unrealized_pl);
+        tr.appendChild(td(fmt2(upl), "num " + (upl === null ? "" : upl >= 0 ? "buy" : "sell")));
+        var pc = num(p.unrealized_plpc);
+        tr.appendChild(td(pc === null ? "" : (pc * 100).toFixed(2) + "%", "num"));
+        tb.appendChild(tr);
+      });
+      var pt = $("pnl-table").tBodies[0]; clear(pt);
+      var pnl = d.realized_pnl_by_symbol && typeof d.realized_pnl_by_symbol === "object" ? d.realized_pnl_by_symbol : {};
+      var keys = Object.keys(pnl).sort();
+      if (!keys.length) placeholderRow(pt, 2, "no realized PnL");
+      var total = 0;
+      keys.forEach(function (k) {
+        var v = num(pnl[k]); if (v !== null) total += v;
+        var tr = el("tr"); tr.appendChild(td(k));
+        tr.appendChild(td(fmt2(v), "num " + (v === null ? "" : v >= 0 ? "buy" : "sell")));
+        pt.appendChild(tr);
+      });
+      if (keys.length) {
+        var tr = el("tr"); var a = td("Total"); a.style.fontWeight = "600"; tr.appendChild(a);
+        var b = td(fmt2(total), "num " + (total >= 0 ? "buy" : "sell")); b.style.fontWeight = "600"; tr.appendChild(b);
+        pt.appendChild(tr);
+      }
+    });
+  }
+
+  /* ---------- algos ---------- */
+  function loadStrategies() {
+    api("GET", "/api/algos/strategies").then(function (res) {
+      var list = Array.isArray(res.data) ? res.data : [];
+      if (!list.length) return;
+      state.strategies = list;
+      var sel = $("algo-strategy"); var prev = sel.value; clear(sel);
+      var firstAvail = null;
+      list.forEach(function (s) {
+        if (!s || !s.id) return;
+        var label = str(s.name || s.id) + (s.available ? "" : " (" + (s.note ? s.note : "unavailable") + ")");
+        var o = el("option", "", label); o.value = s.id;
+        if (!s.available) o.disabled = true; else if (firstAvail === null) firstAvail = s.id;
+        sel.appendChild(o);
+      });
+      var keep = list.some(function (s) { return s && s.id === prev && s.available; });
+      sel.value = keep ? prev : (firstAvail || "");
+      updateStrategyNote();
+    });
+  }
+  function updateStrategyNote() {
+    var id = $("algo-strategy").value, note = "";
+    state.strategies.forEach(function (s) { if (s && s.id === id && s.note) note = str(s.note); });
+    $("algo-strategy-note").textContent = note;
+  }
+  function submitAlgo(body, done) {
+    if (body.live && !confirm("Submit LIVE " + body.strategy + " algo: " + body.side + " " + body.total_qty + " " + body.symbol + "?")) return;
+    api("POST", "/api/algo", body).then(function (res) {
+      var good = replyToast(res, "algo");
+      if (done) done(good);
+      if (good) { if (state.tab === "algos") pollAlgos(); if (state.tab === "activity") pollActivity(); }
+    });
+  }
+  function onAlgoSubmit() {
+    var qty = num($("algo-qty").value), dur = num($("algo-duration").value), n = num($("algo-slices").value);
+    var sym = $("algo-symbol").value.trim();
+    if (!sym) { toast("symbol required", false); return; }
+    if (qty === null || qty <= 0) { toast("total qty must be > 0", false); return; }
+    if (dur === null || dur <= 0) { toast("duration must be > 0", false); return; }
+    if (n === null || n < 1) { toast("slices must be >= 1", false); return; }
+    var cap = num($("algo-cap").value);
+    var body = { strategy: $("algo-strategy").value || "twap", symbol: sym, side: $("algo-side").value,
+      total_qty: qty, duration_s: Math.round(dur), n_slices: Math.round(n), live: $("algo-live").checked, params: {} };
+    if (cap !== null && cap > 0) body.limit_cap = cap;
+    submitAlgo(body, null);
+  }
+  function renderAlgoDetail(cell, detail) {
+    clear(cell);
+    if (!detail) { cell.appendChild(el("span", "muted", "loading...")); return; }
+    var slices = Array.isArray(detail.slices) ? detail.slices : [];
+    if (detail.algo && detail.algo.error) cell.appendChild(el("div", "st-error", "error: " + str(detail.algo.error)));
+    if (!slices.length) { cell.appendChild(el("span", "muted", "no slices")); return; }
+    var t = el("table"); var h = el("tr");
+    ["idx", "scheduled_ts", "qty", "limit_price", "status", "filled_qty", "order_id"].forEach(function (c) { h.appendChild(el("th", "", c)); });
+    var th = el("thead"); th.appendChild(h); t.appendChild(th);
+    var tb = el("tbody");
+    slices.forEach(function (s) {
+      if (!s) return;
+      var tr = el("tr");
+      tr.appendChild(td(str(s.slice_idx)));
+      tr.appendChild(td(fmtTs(s.scheduled_ts)));
+      tr.appendChild(td(fmtQty(s.qty), "num"));
+      tr.appendChild(td(fmt2(s.limit_price), "num"));
+      tr.appendChild(td(str(s.status), "st-" + str(s.status)));
+      tr.appendChild(td(fmtQty(s.filled_qty), "num"));
+      tr.appendChild(td(short(s.order_id, 8), "", str(s.order_id)));
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); cell.appendChild(t);
+  }
+  function fetchDetail(id) {
+    return api("GET", "/api/algo/" + encodeURIComponent(id)).then(function (res) {
+      if (res.data && typeof res.data === "object") state.details[id] = res.data;
+      else state.details[id] = { slices: [] };
+    });
+  }
+  function renderAlgos(rows) {
+    var tb = $("algos-table").tBodies[0]; clear(tb);
+    if (!rows.length) { placeholderRow(tb, 11, "no algos"); return; }
+    rows.forEach(function (a) {
+      if (!a || !a.algo_id) return;
+      var id = a.algo_id;
+      var tr = el("tr", "clickable");
+      tr.appendChild(td(fmtTs(a.created_at)));
+      tr.appendChild(td(short(id, 8), "", str(id)));
+      tr.appendChild(td(str(a.strategy)));
+      tr.appendChild(td(str(a.account)));
+      tr.appendChild(td(str(a.symbol)));
+      tr.appendChild(td(str(a.side), a.side === "buy" ? "buy" : a.side === "sell" ? "sell" : ""));
+      var f = num(a.filled_qty) || 0, tot = num(a.total_qty);
+      var pct = tot && tot > 0 ? Math.max(0, Math.min(100, (f / tot) * 100)) : 0;
+      var pc = el("td"); var pb = el("div", "progress"); var bar = el("div", "bar"); bar.style.width = pct.toFixed(1) + "%";
+      pb.appendChild(bar); pb.appendChild(el("div", "txt", fmtQty(f) + "/" + fmtQty(tot) + " (" + pct.toFixed(0) + "%)"));
+      pc.appendChild(pb); tr.appendChild(pc);
+      tr.appendChild(td(str(num(a.slices_done) === null ? "0" : a.slices_done) + "/" + str(num(a.slices_total) === null ? (a.n_slices || "") : a.slices_total)));
+      tr.appendChild(td(fmt2(a.avg_px), "num"));
+      var stc = td(str(a.status), "st-" + str(a.status)); if (a.error) stc.title = str(a.error); tr.appendChild(stc);
+      var act = el("td");
+      if (a.status === "pending" || a.status === "running") {
+        var b = el("button", "", "Cancel");
+        b.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          if (a.account === "live" && !confirm("Cancel LIVE algo " + short(id, 8) + "?")) return;
+          b.disabled = true;
+          api("DELETE", "/api/algo/" + encodeURIComponent(id)).then(function (res) { replyToast(res, "cancel algo"); pollAlgos(); });
+        });
+        act.appendChild(b);
+      }
+      tr.appendChild(act);
+      tr.addEventListener("click", function () {
+        if (state.expanded[id]) { delete state.expanded[id]; pollAlgos(); return; }
+        state.expanded[id] = true;
+        fetchDetail(id).then(pollAlgos);
+        pollAlgos();
+      });
+      tb.appendChild(tr);
+      if (state.expanded[id]) {
+        var dr = el("tr", "detail"); var dc = el("td"); dc.colSpan = 11;
+        renderAlgoDetail(dc, state.details[id]);
+        dr.appendChild(dc); tb.appendChild(dr);
+      }
+    });
+  }
+  var algoBusy = false;
+  function pollAlgos() {
+    if (algoBusy) return; algoBusy = true;
+    api("GET", "/api/algos?status=" + encodeURIComponent($("algo-filter").value)).then(function (res) {
+      var rows = Array.isArray(res.data) ? res.data : [];
+      var ids = Object.keys(state.expanded);
+      return Promise.all(ids.map(fetchDetail)).then(function () { renderAlgos(rows); });
+    }).catch(function () { renderAlgos([]); }).then(function () { algoBusy = false; });
+  }
+
+  /* ---------- tabs ---------- */
+  var POLLERS = {
+    escalator: [pollOrderbook, 1000], activity: [pollActivity, 3000],
+    summary: [pollSummary, 0], algos: [pollAlgos, 2000]
+  };
+  function switchTab(name) {
+    if (TABS.indexOf(name) < 0) return;
+    state.tab = name;
+    TABS.forEach(function (t) {
+      $("btn-" + t).classList.toggle("active", t === name);
+      $("tab-" + t).classList.toggle("active", t === name);
+    });
+    if (state.poll) { clearInterval(state.poll); state.poll = null; }
+    var p = POLLERS[name];
+    try { p[0](); } catch (e) { /* ignore */ }
+    if (p[1] > 0) state.poll = setInterval(function () { try { p[0](); } catch (e) { /* ignore */ } }, p[1]);
+    if (name === "algos") loadStrategies();
+  }
+  window.switchTab = switchTab;
+  function refreshCurrent() { var p = POLLERS[state.tab]; if (p) p[0](); }
+
+  /* ---------- order modal ---------- */
+  function modalType() {
+    var r = document.querySelector('input[name="m-type"]:checked');
+    return r ? r.value : "limit";
+  }
+  function syncModalType() {
+    var t = modalType();
+    $("m-limit-row").classList.toggle("hidden", t !== "limit");
+    $("m-algo-rows").classList.toggle("hidden", t !== "algo");
+    $("m-tif-row").classList.toggle("hidden", t === "algo");
+  }
+  function openModal(side, price) {
+    if (!state.symbol) { toast("no symbol selected", false); return; }
+    $("m-symbol").value = state.symbol;
+    $("m-side").value = side;
+    $("m-side").className = side;
+    $("m-title").textContent = (side === "buy" ? "BUY " : "SELL ") + state.symbol;
+    var px = num(price);
+    $("m-limit").value = px === null ? "" : String(px);
+    $("m-cap").value = px === null ? "" : String(px);
+    var radios = document.querySelectorAll('input[name="m-type"]');
+    for (var i = 0; i < radios.length; i++) radios[i].checked = radios[i].value === "limit";
+    $("m-tif").value = "gtc";
+    $("m-live").checked = false;
+    syncModalType();
+    $("modal-back").classList.add("open");
+    setTimeout(function () { $("m-qty").focus(); }, 0);
+  }
+  function closeModal() { $("modal-back").classList.remove("open"); }
+  function modalOpen() { return $("modal-back").classList.contains("open"); }
+  var modalBusy = false;
+  function submitModal() {
+    if (modalBusy) return;
+    var t = modalType(), sym = $("m-symbol").value, side = $("m-side").value;
+    var qty = num($("m-qty").value), live = $("m-live").checked;
+    if (qty === null || qty <= 0) { toast("qty must be > 0", false); return; }
+    var after = function (good) {
+      modalBusy = false; $("m-submit").disabled = false;
+      if (good) { closeModal(); pollActivity(); pollAlgos(); }
+    };
+    if (t === "algo") {
+      var dur = num($("m-duration").value), n = num($("m-slices").value), cap = num($("m-cap").value);
+      if (dur === null || dur <= 0 || n === null || n < 1) { toast("duration and slices must be positive", false); return; }
+      var ab = { strategy: "twap", symbol: sym, side: side, total_qty: qty, duration_s: Math.round(dur),
+        n_slices: Math.round(n), live: live, params: {} };
+      if (cap !== null && cap > 0) ab.limit_cap = cap;
+      if (live && !confirm("Submit LIVE TWAP: " + side + " " + qty + " " + sym + "?")) return;
+      modalBusy = true; $("m-submit").disabled = true;
+      api("POST", "/api/algo", ab).then(function (res) { after(replyToast(res, "algo")); });
+      return;
+    }
+    var body = { symbol: sym, qty: qty, side: side, type: t, tif: $("m-tif").value, live: live };
+    if (t === "limit") {
+      var lp = num($("m-limit").value);
+      if (lp === null || lp <= 0) { toast("limit price must be > 0", false); return; }
+      body.limit_price = lp;
+    }
+    if (live && !confirm("Submit LIVE " + t + " order: " + side + " " + qty + " " + sym + "?")) return;
+    modalBusy = true; $("m-submit").disabled = true;
+    api("POST", "/api/order", body).then(function (res) { after(replyToast(res, "order")); });
+  }
+
+  /* ---------- wiring ---------- */
+  TABS.forEach(function (t) { $("btn-" + t).addEventListener("click", function () { switchTab(t); }); });
+  $("global-symbol").addEventListener("change", function () {
+    state.symbol = $("global-symbol").value;
+    $("algo-symbol").value = state.symbol;
+    if (state.tab === "escalator") { renderLadder({}); pollOrderbook(); }
+  });
+  $("btn-refresh").addEventListener("click", function () { loadSymbols().then(refreshCurrent); pollHealth(); });
+  $("act-refresh").addEventListener("click", pollActivity);
+  $("act-status").addEventListener("change", pollActivity);
+  $("act-account").addEventListener("change", pollActivity);
+  $("sum-refresh").addEventListener("click", pollSummary);
+  $("sum-live").addEventListener("change", pollSummary);
+  $("algo-refresh").addEventListener("click", pollAlgos);
+  $("algo-filter").addEventListener("change", pollAlgos);
+  $("algo-submit").addEventListener("click", onAlgoSubmit);
+  $("algo-strategy").addEventListener("change", updateStrategyNote);
+  $("algo-live").addEventListener("change", function () {
+    if ($("algo-live").checked && !confirm("Enable LIVE trading for this algo? Real money will be used.")) $("algo-live").checked = false;
+  });
+  $("m-live").addEventListener("change", function () {
+    if ($("m-live").checked && !confirm("Enable LIVE trading for this order? Real money will be used.")) $("m-live").checked = false;
+  });
+  var radios = document.querySelectorAll('input[name="m-type"]');
+  for (var i = 0; i < radios.length; i++) radios[i].addEventListener("change", syncModalType);
+  $("m-cancel").addEventListener("click", closeModal);
+  $("m-submit").addEventListener("click", submitModal);
+  $("modal-back").addEventListener("click", function (ev) { if (ev.target === $("modal-back")) closeModal(); });
+  document.addEventListener("keydown", function (ev) {
+    if (!modalOpen()) return;
+    if (ev.key === "Escape") { ev.preventDefault(); closeModal(); }
+    else if (ev.key === "Enter") {
+      var tg = ev.target;
+      if (tg && tg.tagName === "BUTTON") return;
+      ev.preventDefault(); submitModal();
+    }
+  });
+
+  renderHealth({});
+  renderLadder({});
+  pollHealth();
+  setInterval(pollHealth, 5000);
+  loadSymbols().then(function () { switchTab("escalator"); });
+  setInterval(function () { if (!$("global-symbol").value) loadSymbols(); }, 10000);
+})();
+</script>
+</body>
+</html>
