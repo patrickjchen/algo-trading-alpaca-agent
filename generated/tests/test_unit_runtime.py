@@ -107,6 +107,43 @@ def test_terminal_statuses():
     assert not (runtime.TERMINAL_STATUSES & runtime.ACTIVE_STATUSES)
 
 
+def test_publish_xadds_json(fake_redis):
+    runtime.publish(fake_redis, "pub", {"a": 1, "b": None})
+    entries = fake_redis.xrange("pub")
+    assert len(entries) == 1
+    assert json.loads(entries[0][1]["json"]) == {"a": 1, "b": None}
+
+
+def test_hset_state(fake_redis):
+    runtime.hset_state(fake_redis, "h", {"a": 1, "b": None, "c": True, "d": {"x": 1}}, ttl=100)
+    h = fake_redis.hgetall("h")
+    assert h == {"a": "1", "c": "1", "d": json.dumps({"x": 1})}
+    assert 0 < fake_redis.ttl("h") <= 100
+    runtime.hset_state(fake_redis, "h", {"a": 2})
+    assert fake_redis.ttl("h") == -1 and fake_redis.hget("h", "a") == "2"
+
+
+def test_key_helpers():
+    assert runtime.order_key("o1") == "alpaca:order:o1"
+    assert runtime.coid_key("c1") == "alpaca:coid:c1"
+    assert runtime.cmd_key("x") == "alpaca:cmd:x"
+    assert runtime.algo_key("a") == "alpaca:algo:a"
+    assert runtime.algo_slices_key("a") == "alpaca:algo:a:slices"
+    assert runtime.reply_key("x") == "alpaca:reply:x"
+    assert runtime.heartbeat_key("oms") == "alpaca:heartbeat:oms"
+
+
+def test_normalize_order():
+    o = runtime.normalize_order({"id": "abc", "side": "OrderSide.BUY", "qty": "0.5",
+                                 "status": "OrderStatus.FILLED", "time_in_force": "gtc",
+                                 "filled_qty": "0.25", "order_type": "limit"})
+    assert o["order_id"] == "abc" and o["side"] == "buy" and o["status"] == "filled"
+    assert o["qty"] == 0.5 and o["filled_qty"] == 0.25 and o["type"] == "limit"
+    assert o["limit_price"] is None and o["client_order_id"] is None
+    empty = runtime.normalize_order({})
+    assert empty["order_id"] is None and set(empty) == set(o)
+
+
 def test_ids():
     cid = runtime.new_client_order_id("tc")
     assert cid.startswith("tc-") and len(cid) <= 48

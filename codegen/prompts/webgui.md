@@ -6,7 +6,7 @@ REQUIREMENTS
 - Helpers: `_live(arg) -> bool` ("1","true","yes"); `_account(live) -> "live"|"paper"`; `_rows(sql, params) -> list[dict]`; `_json_err(msg, code)`.
 - ROUTES (exact rule strings; the verifier checks `app.url_map`):
   `GET /` → `send_from_directory(WEB_DIR, "index.html")` or a 200 text hint if missing.
-  `GET /api/health` → workers = {name: runtime.worker_alive(r, name) for subscriber, trade_stream, oms, ems, webgui} → `{alive: bool, age_s: seconds since its ts or None}`; `redis` = ping ok; `db` = DB file exists and `SELECT 1 FROM orders LIMIT 1` works (or table missing → False); `last_reconcile` = GET alpaca:oms:last_reconcile; `ok` = redis and oms alive and ems alive. Never 500.
+  `GET /api/health` → workers = {name: runtime.worker_alive(r, name) for name in WORKERS = ("subscriber", "trade_stream", "oms", "ems", "algo_engine", "persister", "webgui")} → `{alive: bool, age_s: seconds since its ts or None}`; `redis` = ping ok; `db` = DB file exists and `SELECT 1 FROM orders LIMIT 1` works (or table missing → False); `last_reconcile` = GET alpaca:oms:last_reconcile; `open_orders` = SCARD alpaca:orders:open, `active_algos` = SCARD alpaca:algos:active (0 on error); `ok` = redis and oms, ems and persister alive. Never 500.
   `GET /api/symbols` → sorted SMEMBERS, [] on error.
   `GET /api/orderbook/<path:symbol>` → from `alpaca:ob:bids/asks:<SYM>` hashes (floats, skip ≤0, sort bids desc / asks asc, top 10) + `timestamp` from `alpaca:orderbook:<SYM>`; fallback `alpaca:latest:<SYM>` 1-level book with `fallback:"quote_only"`; else `fallback:"no_data"`.
   `GET /api/latest/<path:symbol>` → HGETALL or {}.
@@ -18,6 +18,6 @@ REQUIREMENTS
   `GET /api/algos/strategies` → `algos.available_strategies()`.
   `POST /api/algo` → validate (strategy in REGISTRY & available, symbol, side, total_qty>0, duration_s≥10, n_slices≥1, optional limit_cap>0, params dict, live) else 400; 503 `{ok False, error:"OMS not running"}` if the OMS heartbeat is missing; `runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {kind:"algo_create", strategy, account, symbol, side, total_qty, duration_s, n_slices, limit_cap, params, source:"webgui"}, timeout=12)`; same status mapping as /api/order (OMS answers with an error reply if EMS is down → 502).
   `GET /api/algos` (status running|all default all; limit 100) → algo_orders rows + `slices_done` (slices with status in filled/rolled/cancelled/failed) and `slices_total` via subqueries, ORDER BY created_at DESC.
-  `GET /api/algo/<algo_id>` → `{algo, slices, orders}` (404 JSON if unknown).
+  `GET /api/algo/<algo_id>` → `{algo, slices, orders}`: prefer the LIVE Redis state (`runtime.algo_key` hash + `runtime.algo_slices_key` hash, JSON-decoded slices sorted by slice_idx) and fall back to SQLite `algo_orders`/`algo_slices`; child `orders` from SQLite (`WHERE algo_id = ?`). 404 JSON if found nowhere.
   `DELETE /api/algo/<algo_id>` → OMS `{kind:"algo_cancel", algo_id, source:"webgui"}`; same status mapping.
-- Import `trader`, `algos`, `runtime` (flat imports, same dir). No network at import. Call `mcp__verify__verify_stage(stage="webgui")`.
+- Import `trader`, `algos`, `runtime` (flat imports, same dir); do NOT import oms/ems/algo_engine/persister. SQLite strictly read-only (tables are created by persister; a missing table → empty result). No network at import. Call `mcp__verify__verify_stage(stage="webgui")`.

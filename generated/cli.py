@@ -16,7 +16,7 @@ from pathlib import Path
 import runtime
 import trader
 
-WORKERS_REQUIRED = ("subscriber", "trade_stream", "oms", "ems")
+WORKERS_REQUIRED = ("subscriber", "trade_stream", "oms", "ems", "algo_engine", "persister")
 OMS_DOWN_MSG = "OMS is not running (no heartbeat); start generated/oms_ems.py or use --direct"
 
 
@@ -55,7 +55,7 @@ def _redis():
 def _db():
     p = runtime.DB_PATH
     if p != ":memory:" and not Path(p).exists():
-        _err(f"SQLite database not found at {p} (has the OMS run yet?)")
+        _err(f"SQLite database not found at {p} (has the persister run yet?)")
         sys.exit(1)
     try:
         return runtime.sqlite_connect()
@@ -184,7 +184,73 @@ def cmd_health(args) -> int:
     except Exception:
         pass
     print(f"oms last_reconcile: {lr or 'never'}" + (f" ({_age_s(lr)}s ago)" if lr else ""))
+    for label, key in (("open orders", runtime.SET_OPEN_ORDERS), ("active algos", runtime.SET_ACTIVE_ALGOS)):
+        try:
+            n = r.scard(key)
+        except Exception:
+            n = "?"
+        print(f"{label} ({key}): {n}")
     return 1 if any_down else 0
+
+
+def _db_optional():
+    p = runtime.DB_PATH
+    if p != ":memory:" and not Path(p).exists():
+        return None
+    try:
+        return runtime.sqlite_connect()
+    except Exception:
+        return None
+
+
+def _decode_hash(h: dict) -> dict:
+    out = {}
+    for k, v in (h or {}).items():
+        if isinstance(v, str) and v[:1] in "[{":
+            try:
+                out[k] = json.loads(v)
+                continue
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+
+def cmd_order(args) -> int:
+    ident = str(args.ident).strip()
+    r = None
+    try:
+        r = runtime.get_redis()
+        r.ping()
+    except Exception as e:
+        _err(f"Redis unreachable ({e}); falling back to SQLite")
+        r = None
+    if r is not None:
+        try:
+            h = r.hgetall(runtime.order_key(ident))
+            if not h:
+                oid = r.get(runtime.coid_key(ident))
+                if oid:
+                    h = r.hgetall(runtime.order_key(oid))
+            if h:
+                _out({"source": "redis", **_decode_hash(h)})
+                return 0
+        except Exception as e:
+            _err(f"Redis lookup failed: {e}")
+    conn = _db_optional()
+    if conn is None:
+        _err(f"order {ident} not found in Redis and no SQLite database at {runtime.DB_PATH}")
+        return 1
+    try:
+        rows = _query(conn, "SELECT * FROM orders WHERE order_id = ? OR client_order_id = ? LIMIT 1",
+                      (ident, ident))
+    finally:
+        conn.close()
+    if not rows:
+        _err(f"order {ident} not found")
+        return 1
+    _out({"source": "sqlite", **rows[0]})
+    return 0
 
 
 # --------------------------------------------------------------------------- trading
@@ -330,13 +396,46 @@ def cmd_twap(args) -> int:
                                             timeout=args.timeout))
 
 
+def _live_slices(r, aid) -> list:
+    out = []
+    for k, v in (r.hgetall(runtime.algo_slices_key(aid)) or {}).items():
+        try:
+            out.append(json.loads(v))
+        except ValueError:
+            out.append({"slice_idx": k, "raw": v})
+
+    def _k(s):
+        try:
+            return int(s.get("slice_idx"))
+        except Exception:
+            return 0
+    return sorted(out, key=_k)
+
+
 def cmd_algos(args) -> int:
+    if args.status == "running":
+        r = _redis()
+        ids = sorted(r.smembers(runtime.SET_ACTIVE_ALGOS) or [])
+        algos = []
+        for aid in ids:
+            h = r.hgetall(runtime.algo_key(aid))
+            if not h:
+                continue
+            a = _decode_hash(h)
+            sl = _live_slices(r, aid)
+            counts: dict = {}
+            for s in sl:
+                st = s.get("status")
+                counts[st] = counts.get(st, 0) + 1
+            a["slice_counts"] = counts
+            a["slices_total"] = len(sl)
+            algos.append(a)
+        _out(algos)
+        return 0
     conn = _db()
     try:
         sql = "SELECT * FROM algo_orders"
         params: list = []
-        if args.status == "running":
-            sql += " WHERE status IN ('running', 'pending')"
         sql += " ORDER BY rowid DESC LIMIT ?"
         params.append(max(1, int(args.limit)))
         algos = _query(conn, sql, params)
@@ -353,26 +452,44 @@ def cmd_algos(args) -> int:
 
 
 def cmd_algo(args) -> int:
-    conn = _db()
+    aid = str(args.algo_id).strip()
+    algo, slices, src = None, None, None
     try:
-        rows = _query(conn, "SELECT * FROM algo_orders WHERE algo_id = ?", (args.algo_id,))
-        if not rows:
-            rows = _query(conn, "SELECT * FROM algo_orders WHERE algo_id LIKE ? LIMIT 2",
-                          (args.algo_id + "%",))
-            if len(rows) != 1:
-                _err(f"algo {args.algo_id} not found")
-                return 1
-        algo = rows[0]
-        aid = algo.get("algo_id")
-        slices = _query(conn, "SELECT * FROM algo_slices WHERE algo_id = ? ORDER BY rowid", (aid,))
-        children = _query(conn, "SELECT order_id, client_order_id, symbol, side, type, time_in_force, "
-                                "qty, limit_price, filled_qty, filled_avg_price, status, slice_idx, "
-                                "submitted_at, updated_at FROM orders WHERE algo_id = ? OR "
-                                "client_order_id LIKE ? ORDER BY slice_idx",
-                          (aid, f"algo-{str(aid)[:12]}-%"))
-        _out({"algo": algo, "slices": slices, "child_orders": children})
+        r = runtime.get_redis()
+        h = r.hgetall(runtime.algo_key(aid))
+        if h:
+            algo, slices, src = _decode_hash(h), _live_slices(r, aid), "redis"
+    except Exception as e:
+        _err(f"Redis lookup failed ({e}); using SQLite")
+    conn = _db_optional()
+    children: list = []
+    try:
+        if conn is not None:
+            if algo is None:
+                rows = _query(conn, "SELECT * FROM algo_orders WHERE algo_id = ?", (aid,))
+                if not rows:
+                    rows = _query(conn, "SELECT * FROM algo_orders WHERE algo_id LIKE ? LIMIT 2",
+                                  (aid + "%",))
+                    if len(rows) != 1:
+                        rows = []
+                if rows:
+                    algo, src = rows[0], "sqlite"
+                    aid = algo.get("algo_id")
+                    slices = _query(conn, "SELECT * FROM algo_slices WHERE algo_id = ? "
+                                          "ORDER BY slice_idx", (aid,))
+            if algo is not None:
+                children = _query(conn, "SELECT order_id, client_order_id, symbol, side, type, "
+                                        "time_in_force, qty, limit_price, filled_qty, filled_avg_price, "
+                                        "status, slice_idx, submitted_at, updated_at FROM orders "
+                                        "WHERE algo_id = ? OR client_order_id LIKE ? ORDER BY slice_idx",
+                                  (aid, f"algo-{str(aid)[:12]}-%"))
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+    if algo is None:
+        _err(f"algo {args.algo_id} not found")
+        return 1
+    _out({"source": src, "algo": algo, "slices": slices or [], "child_orders": children})
     return 0
 
 
@@ -419,6 +536,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("orders", cmd_orders, "orders (SQLite; --direct for REST)", live=True, direct=True)
     sp.add_argument("--status", choices=["open", "closed", "all"], default="open")
     sp.add_argument("--limit", type=int, default=50)
+    sp = add("order", cmd_order, "one order: live Redis hash (falls back to SQLite)")
+    sp.add_argument("ident", metavar="ORDER_ID_or_CLIENT_ORDER_ID")
     for name, fn in (("buy", cmd_buy), ("sell", cmd_sell)):
         sp = add(name, fn, f"{name} via OMS", live=True, direct=True, timeout=True)
         sp.add_argument("symbol")
@@ -437,8 +556,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--duration", type=float, default=300.0, help="seconds")
     sp.add_argument("--slices", type=int, default=10)
     sp.add_argument("--limit-cap", dest="limit_cap", type=float, default=None)
-    sp = add("algos", cmd_algos, "list algos (SQLite)")
-    sp.add_argument("--status", choices=["running", "all"], default="all")
+    sp = add("algos", cmd_algos, "list algos (running: live Redis; all: SQLite)")
+    sp.add_argument("--status", choices=["running", "all"], default="running")
     sp.add_argument("--limit", type=int, default=50)
     sp = add("algo", cmd_algo, "algo detail (SQLite)")
     sp.add_argument("algo_id")

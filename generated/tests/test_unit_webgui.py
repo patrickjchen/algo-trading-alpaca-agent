@@ -18,6 +18,8 @@ def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     d = r.get_json()
+    assert set(d["workers"]) >= {"subscriber", "trade_stream", "oms", "ems", "algo_engine",
+                                 "persister", "webgui"}
     assert all(w["alive"] is False for w in d["workers"].values())
     assert d["db"] is False
 

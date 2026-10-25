@@ -223,7 +223,6 @@
 <script>
 (function () {
   "use strict";
-  var WORKERS = ["subscriber", "trade_stream", "oms", "ems", "webgui"];
   var TABS = ["escalator", "activity", "summary", "algos"];
   var ACTIVE = { "new": 1, "accepted": 1, "pending_new": 1, "partially_filled": 1, "pending_cancel": 1, "pending_replace": 1 };
   var state = { tab: "escalator", poll: null, symbol: "", expanded: {}, details: {}, strategies: [] };
@@ -303,8 +302,10 @@
   function renderHealth(h) {
     var strip = $("health-strip"); clear(strip);
     h = h || {};
-    var workers = h.workers || {};
-    WORKERS.forEach(function (w) {
+    var workers = h.workers && typeof h.workers === "object" ? h.workers : {};
+    var names = Object.keys(workers);
+    if (!names.length) strip.appendChild(el("span", "dotlabel", "workers: unknown"));
+    names.forEach(function (w) {
       var info = workers[w] || {};
       var alive = !!info.alive;
       var p = el("span", "pill " + (alive ? "up" : "down"), alive ? w : w + " down");
