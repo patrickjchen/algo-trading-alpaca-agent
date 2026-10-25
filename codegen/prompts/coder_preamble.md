@@ -17,12 +17,20 @@ stdlib. Tests may also use `pytest`, `fakeredis`. Nothing else.
 ```
 subscriber.py   CryptoDataStream ─────────────► Redis market keys (alpaca:latest/ob/recent/symbols)
 trade_stream.py TradingStream    ─────────────► Redis Stream alpaca:trade_updates
-oms.py   (Order Management)  consumes alpaca:trade_updates + alpaca:oms:commands
-                              ONLY process that calls Alpaca order endpoints
-                              owns SQLite tables orders, fills, trade_events, commands
-ems.py   (Execution Mgmt)    consumes alpaca:ems:requests; schedules algo slices (TWAP)
-                              submits children THROUGH OMS; owns algo_orders, algo_slices
-webgui.py / cli.py           read Redis + SQLite; send commands to OMS/EMS; never write SQLite
+oms.py   (Order Management)  the FRONT DOOR for every order intent: consumes alpaca:oms:commands
+                              (submit / cancel / algo_create / algo_cancel) + alpaca:trade_updates
+                              (exchange events AND EMS execution reports). Owns the order LIFECYCLE:
+                              SQLite orders, fills, trade_events, commands; idempotency; REST reconciliation.
+                              Makes NO Alpaca order calls: forwards execution to EMS over
+                              alpaca:ems:requests and relays EMS's reply to the original caller.
+ems.py   (Execution Mgmt)    the ONLY process that calls Alpaca order endpoints (through trader.py).
+                              consumes alpaca:ems:requests: submit / cancel_order (single orders, on
+                              behalf of OMS) and create / cancel (algos). Runs the TWAP engine and
+                              submits its children itself. Publishes an EXECUTION REPORT to
+                              alpaca:trade_updates for every submit/cancel it performs.
+                              Owns algo_orders, algo_slices.
+oms_ems.py                   hosts oms.body + ems.body as two supervised threads in one process
+webgui.py / cli.py           read Redis + SQLite; send EVERY order/algo intent to OMS; never write SQLite
 runtime.py                   shared: resilient Redis, supervisor, heartbeat, SQLite, commands
 algos.py                     pure strategy math (TWAP real; VWAP/IS stubs)
 ```
@@ -54,8 +62,9 @@ algos.py                     pure strategy math (TWAP real; VWAP/IS stubs)
 - Consumer groups via `runtime.ensure_group` + `runtime.GroupReader` (drains own pending entries first, XAUTOCLAIMs stale ones, then reads `>`). Per entry: try → commit → ack; except → rollback → `reader.dead_letter(...)` (which also acks). Every row keyed by `stream_id` / `execution_id` / `client_order_id` is idempotent (INSERT OR IGNORE / upsert), so replay is harmless.
 
 **Orders**
-- ONLY oms.py calls Alpaca order endpoints (`submit_order`, `cancel_order_by_id`, …) through trader.py. Everyone else sends a command: `runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload)` and gets the reply dict (or a timeout reply). Before sending, callers check `runtime.worker_alive(r, "oms")`; webgui returns HTTP 503 JSON if OMS is down.
-- Every submit carries a `client_order_id` (`runtime.new_client_order_id("tc")` for manual, `algo-<algo_id[:12]>-<idx:03d>` for EMS children; ≤48 chars, `[A-Za-z0-9_-]`). OMS is idempotent on it: an existing `orders`/`commands` row with that id means "already submitted" (reply with the existing order, do not resubmit); on timeout/connection error after submit, OMS calls `trader.get_order_by_client_id` before declaring status `unknown`; an Alpaca 422 mentioning client_order_id → treat as already submitted and look it up.
+- OMS → EMS → exchange. ONLY ems.py calls Alpaca order endpoints (`submit_order`, `cancel_order_by_id`, …) through trader.py. OMS is the front door: webgui, cli and tests send `runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload)` for `submit`, `cancel`, `algo_create` and `algo_cancel` and get the reply dict (or a timeout reply). OMS validates, audits in `commands`, enforces idempotency, then forwards to EMS with `runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, …)` (kinds `submit`, `cancel_order`, `create`, `cancel`) and relays the reply. Callers check `runtime.worker_alive(r, "oms")` first (webgui → HTTP 503 if OMS is down); OMS itself answers `{ok: False, status: "error", error: "EMS not running"}` without forwarding when `runtime.worker_alive(r, "ems")` is None. Nobody but OMS talks to EMS; nobody but EMS talks to the exchange's order endpoints (read-only REST such as `get_order_by_client_id`, `list_orders`, `account` is fine anywhere).
+- Every submit carries a `client_order_id` (`runtime.new_client_order_id("tc")` for manual, `algo-<algo_id[:12]>-<idx:03d>` for EMS children; ≤48 chars, `[A-Za-z0-9_-]`). OMS is idempotent on it: an existing `orders`/`commands` row with that id means "already submitted" (reply with the existing order row, do not forward). EMS handles the exchange side: an Alpaca 422 mentioning client_order_id → `trader.get_order_by_client_id` → `already_submitted`; a transient error → retry 3× (0.5/1/2 s), then look up by client_order_id, else status `unknown` (ok False).
+- EXECUTION REPORTS: after every successful Alpaca submit or cancel request EMS XADDs to `alpaca:trade_updates` (same `{"json": …}` encoding as trade_stream) a payload with `event` = `ems_submitted` | `ems_cancel_requested`, `execution_id: None`, `order_id`, `client_order_id`, `symbol`, `side`, `qty`, `price: None`, `ts`, `account`, `order: {full order dict}`, plus `source`, `algo_id`, `slice_idx`. OMS's `handle_payload` upserts the `orders` row from it (so the row exists with the right `source/algo_id/slice_idx` even before the exchange's `new` event arrives) and never writes a `fills` row for these events. Exchange events for the same order arrive later and are merged idempotently.
 - Account is explicit everywhere: `account` column/field is `"paper"` or `"live"`; `live` is an explicit opt-in flag at every layer; paper is the default. Printing a stderr warning before any live action in cli.py.
 - Crypto: `time_in_force` is `gtc` (resting) or `ioc` (final TWAP slice); never `day`. Use `qty=`, never `notional=`. Numeric fields on Alpaca `Order` objects are STRINGS → `float(x) if x is not None else None`. Round qty DOWN to the asset's `min_trade_increment`, reject below `min_order_size`, round prices to `price_increment` (from `trader.get_asset_rules`).
 - Order status strings are lowercase (`new`, `accepted`, `pending_new`, `partially_filled`, `filled`, `canceled`, `expired`, `rejected`, `replaced`, `pending_cancel`, `pending_replace`). `runtime.TERMINAL_STATUSES = {filled, canceled, expired, rejected, replaced}`; an upsert must never move a terminal status back to a non-terminal one.
@@ -72,8 +81,14 @@ trader.py: `get_client(live=False)`, `_to_dict(obj)`, `account(live)`, `position
 
 Redis Stream payloads (one field `json`, JSON-encoded, `default=str`):
 - `alpaca:trade_updates`: `{event, execution_id, order_id, client_order_id, symbol, side, price, qty, position_qty, ts, account, order: {…full order dict…}}`
-- `alpaca:oms:commands` submit: `{cmd_id, kind:"submit", account, client_order_id, symbol, side:"buy"|"sell", type:"market"|"limit", qty, limit_price, tif:"gtc"|"ioc", source:"webgui"|"cli"|"ems", algo_id, slice_idx}`; cancel: `{cmd_id, kind:"cancel", account, order_id?, client_order_id?, source}`.
-  Reply (RPUSH `alpaca:reply:<cmd_id>`, EXPIRE 60): `{ok, status: "acked"|"already_submitted"|"rejected"|"unknown"|"error"|"cancel_requested"|"not_found", cmd_id, order_id, client_order_id, order, error}`.
-- `alpaca:ems:requests` create: `{req_id, kind:"create", strategy:"twap", account, symbol, side, total_qty, duration_s, n_slices, limit_cap, params, source}`; cancel: `{req_id, kind:"cancel", algo_id}`. Reply on `alpaca:reply:<req_id>`: `{ok, algo_id, status, error, algo}`.
+- `alpaca:trade_updates`: the payload above may also carry optional `source`, `algo_id`, `slice_idx`; `event` may be an EMS execution report `ems_submitted` / `ems_cancel_requested` (see Orders rules).
+- `alpaca:oms:commands` (id field is always `cmd_id`; `runtime.send_command` fills it in):
+  submit: `{cmd_id, kind:"submit", account, client_order_id, symbol, side:"buy"|"sell", type:"market"|"limit", qty, limit_price, tif:"gtc"|"ioc", source:"webgui"|"cli"|"test"}`; cancel: `{cmd_id, kind:"cancel", account, order_id?, client_order_id?, source}`;
+  algo_create: `{cmd_id, kind:"algo_create", strategy:"twap", account, symbol, side, total_qty, duration_s, n_slices, limit_cap, params, source}`; algo_cancel: `{cmd_id, kind:"algo_cancel", algo_id, source}`.
+  Reply (RPUSH `alpaca:reply:<cmd_id>`, EXPIRE 60) for submit/cancel: `{ok, status: "acked"|"already_submitted"|"rejected"|"unknown"|"error"|"cancel_requested"|"not_found"|"timeout", cmd_id, order_id, client_order_id, order, error}`; for algo_create/algo_cancel: `{ok, status, cmd_id, algo_id, algo, error}`.
+- `alpaca:ems:requests` (id field `cmd_id`; only OMS sends these):
+  submit: `{cmd_id, kind:"submit", account, client_order_id, symbol, side, type, qty, limit_price, tif, source, algo_id?, slice_idx?}` → reply `{ok, status: "acked"|"already_submitted"|"rejected"|"unknown"|"error", cmd_id, order_id, client_order_id, order, error}`;
+  cancel_order: `{cmd_id, kind:"cancel_order", account, order_id?, client_order_id?, source}` → `{ok, status: "cancel_requested"|"not_found"|"error", cmd_id, order_id, error}`;
+  create: `{cmd_id, kind:"create", strategy:"twap", account, symbol, side, total_qty, duration_s, n_slices, limit_cap, params, source}`; cancel: `{cmd_id, kind:"cancel", algo_id}` → `{ok, status, cmd_id, algo_id, algo, error}`.
 
 SQLite (one file, `runtime.DB_PATH`): see oms.md / ems.md for the exact DDL; webgui/cli read these tables.

@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 import runtime
-from tests.conftest import db, ensure_worker, round_up, wait_until
+from tests.conftest import db, ensure_oms_ems, ensure_worker, round_up, wait_until
 
 pytestmark = pytest.mark.live
 
@@ -24,8 +24,9 @@ def test_twap_end_to_end(live_redis, request):
         pytest.skip("needs --run-twap (places and fills real paper orders)")
     import trader
     r = live_redis
-    for w in ("subscriber", "trade_stream", "oms", "ems"):
+    for w in ("subscriber", "trade_stream"):
         ensure_worker(w)
+    ensure_oms_ems()
 
     rules = trader.get_asset_rules("BTC/USD")
     min_qty = round_up(max(rules["min_order_size"] or 0.0, rules["min_trade_increment"] or 0.0),
@@ -33,8 +34,8 @@ def test_twap_end_to_end(live_redis, request):
     total = round_up(2 * min_qty, rules["min_trade_increment"])
     algo_id = None
     try:
-        rep = runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, {
-            "req_id": runtime.new_id(), "kind": "create", "strategy": "twap", "account": "paper",
+        rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
+            "kind": "algo_create", "strategy": "twap", "account": "paper",
             "symbol": "BTC/USD", "side": "buy", "total_qty": total, "duration_s": 30, "n_slices": 2,
             "limit_cap": None, "params": {}, "source": "test"}, timeout=20)
         print("create reply:", {k: rep.get(k) for k in ("ok", "status", "algo_id", "error")})
@@ -62,5 +63,5 @@ def test_twap_end_to_end(live_redis, request):
         if algo_id:
             st = _q("SELECT status FROM algo_orders WHERE algo_id=?", (algo_id,))
             if st and st[0]["status"] in ("pending", "running"):
-                runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, {
-                    "req_id": runtime.new_id(), "kind": "cancel", "algo_id": algo_id}, timeout=20)
+                runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
+                    "kind": "algo_cancel", "algo_id": algo_id, "source": "test"}, timeout=20)

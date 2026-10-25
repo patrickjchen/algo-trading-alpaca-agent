@@ -95,5 +95,44 @@ def test_post_algo_ems_down(client):
     assert r.status_code == 503
 
 
+ALGO = {"strategy": "twap", "symbol": "BTC/USD", "side": "buy", "total_qty": 0.01,
+        "duration_s": 60, "n_slices": 3}
+
+
+def _capture(monkeypatch, reply):
+    sent = []
+
+    def fake_send(r, stream, payload, timeout=10.0):
+        sent.append((stream, dict(payload)))
+        return reply
+
+    monkeypatch.setattr(webgui.runtime, "send_command", fake_send)
+    return sent
+
+
+def test_post_algo_oms_up(client, fake_redis, monkeypatch):
+    runtime.Heartbeat(fake_redis, "oms").beat()
+    sent = _capture(monkeypatch, {"ok": True, "status": "pending", "algo_id": "a1"})
+    r = client.post("/api/algo", json=ALGO)
+    assert r.status_code == 200 and r.get_json()["algo_id"] == "a1"
+    assert len(sent) == 1
+    stream, payload = sent[0]
+    assert stream == runtime.STREAM_OMS_COMMANDS and stream != runtime.STREAM_EMS_REQUESTS
+    assert payload["kind"] == "algo_create" and payload["strategy"] == "twap"
+
+
+def test_delete_algo(client, fake_redis, monkeypatch):
+    runtime.Heartbeat(fake_redis, "oms").beat()
+    sent = _capture(monkeypatch, {"ok": True, "status": "cancelled", "algo_id": "a1"})
+    r = client.delete("/api/algo/a1")
+    assert r.status_code == 200
+    assert sent[0][0] == runtime.STREAM_OMS_COMMANDS
+    assert sent[0][1]["kind"] == "algo_cancel" and sent[0][1]["algo_id"] == "a1"
+
+
+def test_delete_algo_oms_down(client):
+    assert client.delete("/api/algo/a1").status_code == 503
+
+
 def test_algo_not_found(client):
     assert client.get("/api/algo/nope").status_code == 404

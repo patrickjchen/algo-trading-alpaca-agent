@@ -1,4 +1,7 @@
-"""Live: trade updates buffered in the stream while OMS is down are consumed after restart."""
+"""Live: trade updates buffered in the stream while OMS is down are consumed after restart.
+
+Only runs when the OMS process was started by the test session (never kills the user's OMS).
+"""
 from __future__ import annotations
 
 import json
@@ -7,7 +10,8 @@ import uuid
 import pytest
 
 import runtime
-from tests.conftest import db, ensure_worker, started_by_tests, stop_worker, wait_until
+from tests.conftest import (db, ensure_oms_ems, oms_host_started_by_tests, stop_worker,
+                            wait_until)
 
 pytestmark = pytest.mark.live
 
@@ -32,11 +36,14 @@ def _pending(r):
 
 def test_oms_resumes_buffered_updates(live_redis):
     r = live_redis
-    ensure_worker("oms")
-    if not started_by_tests("oms"):
+    ensure_oms_ems()
+    host = oms_host_started_by_tests()
+    if host is None:
         pytest.skip("oms is run by the user; not killing it")
 
-    stop_worker("oms")
+    stop_worker(host)
+    runtime_key = runtime.heartbeat_key("oms")
+    r.delete(runtime_key)
     assert not runtime.worker_alive(r, "oms")
 
     ids = []
@@ -50,10 +57,11 @@ def test_oms_resumes_buffered_updates(live_redis):
         payload = {"event": "canceled", "execution_id": None, "order_id": oid,
                    "client_order_id": order["client_order_id"], "symbol": "BTC/USD", "side": "buy",
                    "price": None, "qty": None, "position_qty": None, "ts": runtime.now_iso(),
-                   "account": "paper", "order": order}
+                   "account": "paper", "order": order, "source": "test"}
         r.xadd(runtime.STREAM_TRADE_UPDATES, {"json": json.dumps(payload, default=str)})
 
-    ensure_worker("oms")
+    ensure_oms_ems()
+    assert runtime.worker_alive(r, "oms")
     assert wait_until(lambda: _count_events(ids) == 3, 15), \
         f"only {_count_events(ids)}/3 synthetic updates reached trade_events"
     assert wait_until(lambda: _pending(r) == 0, 15), f"XPENDING oms = {_pending(r)}"

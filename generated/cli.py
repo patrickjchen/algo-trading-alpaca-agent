@@ -1,6 +1,7 @@
 """Command-line interface for the Alpaca crypto pipeline.
 
-Reads Redis market data / SQLite order state; sends commands to OMS / EMS.
+Reads Redis market data / SQLite order state; sends every order/algo intent to OMS
+(which forwards execution to EMS). Never talks to EMS directly.
 Never writes SQLite. Nothing happens at import time.
 """
 from __future__ import annotations
@@ -16,8 +17,7 @@ import runtime
 import trader
 
 WORKERS_REQUIRED = ("subscriber", "trade_stream", "oms", "ems")
-OMS_DOWN_MSG = "OMS is not running (no heartbeat); start generated/oms.py or use --direct"
-EMS_DOWN_MSG = "EMS is not running (no heartbeat); start generated/ems.py"
+OMS_DOWN_MSG = "OMS is not running (no heartbeat); start generated/oms_ems.py or use --direct"
 
 
 # --------------------------------------------------------------------------- helpers
@@ -104,14 +104,8 @@ def _require_oms(r) -> None:
         sys.exit(2)
 
 
-def _require_ems(r) -> None:
-    if runtime.worker_alive(r, "ems") is None:
-        _err(EMS_DOWN_MSG)
-        sys.exit(2)
-
-
 def _warn_direct() -> None:
-    _err("WARNING: --direct bypasses the OMS; order state will only sync on OMS reconcile")
+    _err("WARNING: --direct bypasses OMS and EMS; order state will only sync on OMS reconcile")
 
 
 def _reply_exit(reply: dict) -> int:
@@ -255,8 +249,7 @@ def _submit(args, side: str) -> int:
     _require_oms(r)
     payload = {"kind": "submit", "account": _account(args), "client_order_id": coid,
                "symbol": sym, "side": side, "type": otype, "qty": qty,
-               "limit_price": args.limit, "tif": args.tif, "source": "cli",
-               "algo_id": None, "slice_idx": None}
+               "limit_price": args.limit, "tif": args.tif, "source": "cli"}
     return _reply_exit(runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload,
                                             timeout=args.timeout))
 
@@ -328,13 +321,12 @@ def cmd_twap(args) -> int:
         _err("qty, --duration and --slices must be > 0")
         return 2
     r = _redis()
-    _require_ems(r)
-    req_id = runtime.new_id()
-    payload = {"req_id": req_id, "cmd_id": req_id, "kind": "create", "strategy": "twap",
+    _require_oms(r)
+    payload = {"kind": "algo_create", "strategy": "twap",
                "account": _account(args), "symbol": sym, "side": side, "total_qty": qty,
                "duration_s": float(args.duration), "n_slices": int(args.slices),
                "limit_cap": args.limit_cap, "params": {}, "source": "cli"}
-    return _reply_exit(runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, payload,
+    return _reply_exit(runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload,
                                             timeout=args.timeout))
 
 
@@ -344,7 +336,7 @@ def cmd_algos(args) -> int:
         sql = "SELECT * FROM algo_orders"
         params: list = []
         if args.status == "running":
-            sql += " WHERE status IN ('running', 'pending', 'new', 'cancelling')"
+            sql += " WHERE status IN ('running', 'pending')"
         sql += " ORDER BY rowid DESC LIMIT ?"
         params.append(max(1, int(args.limit)))
         algos = _query(conn, sql, params)
@@ -386,11 +378,9 @@ def cmd_algo(args) -> int:
 
 def cmd_algo_cancel(args) -> int:
     r = _redis()
-    _require_ems(r)
-    req_id = runtime.new_id()
-    payload = {"req_id": req_id, "cmd_id": req_id, "kind": "cancel", "algo_id": args.algo_id,
-               "source": "cli"}
-    return _reply_exit(runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, payload,
+    _require_oms(r)
+    payload = {"kind": "algo_cancel", "algo_id": args.algo_id, "source": "cli"}
+    return _reply_exit(runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload,
                                             timeout=args.timeout))
 
 
@@ -440,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--client", action="store_true", help="ORDER_ID is a client_order_id")
     add("cancel-all", cmd_cancel_all, "cancel all open orders", live=True, direct=True, timeout=True)
 
-    sp = add("twap", cmd_twap, "start a TWAP algo via EMS", live=True, timeout=True)
+    sp = add("twap", cmd_twap, "start a TWAP algo via OMS", live=True, timeout=True)
     sp.add_argument("symbol")
     sp.add_argument("side", choices=["buy", "sell"], type=str.lower)
     sp.add_argument("qty")
@@ -452,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50)
     sp = add("algo", cmd_algo, "algo detail (SQLite)")
     sp.add_argument("algo_id")
-    sp = add("algo-cancel", cmd_algo_cancel, "cancel an algo via EMS", timeout=True)
+    sp = add("algo-cancel", cmd_algo_cancel, "cancel an algo via OMS", timeout=True)
     sp.add_argument("algo_id")
     return p
 
