@@ -176,10 +176,55 @@ def stop_worker(name: str, timeout: float = 15.0) -> None:
                 p.wait(timeout=5)
             except Exception:  # noqa: BLE001
                 pass
+    keys = [runtime.heartbeat_key(name)]
+    if name == "oms_ems":
+        keys += [runtime.heartbeat_key("oms"), runtime.heartbeat_key("ems")]
     try:
-        redis_client().delete(runtime.heartbeat_key(name))
+        redis_client().delete(*keys)
     except Exception:  # noqa: BLE001
         pass
+
+
+def ensure_oms_ems(timeout: float = 20.0) -> list:
+    """Make sure both OMS and EMS heartbeats exist.
+
+    Neither alive -> start ``oms_ems.py`` once and wait for BOTH heartbeats; exactly one alive
+    -> start only the missing standalone module. Returns the names of processes started."""
+    r = redis_client()
+    oms_up = runtime.worker_alive(r, "oms") is not None
+    ems_up = runtime.worker_alive(r, "ems") is not None
+    if oms_up and ems_up:
+        return []
+    if not oms_up and not ems_up:
+        p = STARTED.get("oms_ems")
+        if p is None or p.poll() is not None:
+            errf = tempfile.NamedTemporaryFile(prefix="live-oms_ems-", suffix=".log", delete=False)
+            p = subprocess.Popen([sys.executable, "oms_ems.py"], cwd=str(GEN_DIR),
+                                 env=os.environ.copy(), stdout=subprocess.DEVNULL, stderr=errf)
+            STARTED["oms_ems"] = p
+            logname = errf.name
+        else:
+            logname = "?"
+
+        def both():
+            return (runtime.worker_alive(r, "oms") and runtime.worker_alive(r, "ems")) \
+                or p.poll() is not None
+
+        if not wait_until(both, timeout) or p.poll() is not None:
+            stop_worker("oms_ems")
+            pytest.fail(f"oms_ems did not heartbeat oms+ems within {timeout}s (log: {logname})")
+        return ["oms_ems"]
+    missing = "ems" if oms_up else "oms"
+    ensure_worker(missing, timeout)
+    return [missing]
+
+
+def oms_host_started_by_tests() -> str | None:
+    """Name of the test-started process hosting OMS ('oms' or 'oms_ems'), else None."""
+    for name in ("oms", "oms_ems"):
+        if started_by_tests(name):
+            return name
+    return None
 
 
 def stop_all_started() -> None:

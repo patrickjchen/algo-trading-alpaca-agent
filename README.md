@@ -9,10 +9,12 @@ Tester triages pytest failures back to the responsible module.
 
 Compared with the AG2/Gemini predecessor (`../TradingWithAlpaca` (the AG2/Gemini original)) the pipeline adds:
 
-* **OMS** worker — single Alpaca write path, idempotent `client_order_id`, consumer-group recovery,
-  dead-letter stream, REST reconciliation, paper/live separation.
-* **EMS** worker — execution algorithms with persisted, restart-safe schedules. **TWAP** implemented;
-  VWAP and Implementation Shortfall registered as stubs and shown disabled in the GUI.
+* **OMS** — order lifecycle: the front door for every order and algo intent, idempotent
+  `client_order_id`, audit trail, consumer-group recovery, dead-letter stream, REST reconciliation,
+  paper/live separation. Forwards execution to EMS; never calls Alpaca order endpoints itself.
+* **EMS** — execution: the single Alpaca write path, execution reports back to OMS, and execution
+  algorithms with persisted, restart-safe schedules. **TWAP** implemented; VWAP and Implementation
+  Shortfall registered as stubs and shown disabled in the GUI. Both run in one `oms_ems` process.
 * **Fault tolerance** — supervisor with backoff, heartbeats, Redis retry + spill buffer, WAL SQLite,
   health endpoint and health strip in the UI.
 * **Tests** — offline unit suite (fakeredis) and live integration suite that really connects to
@@ -33,7 +35,7 @@ python claude_codegen.py --stage all    # regenerate everything
 ```bash
 cp run.bash.example run.bash && $EDITOR run.bash && source run.bash
 docker run -d -p 6379:6379 redis
-scripts/run_all.sh                      # subscriber, trade_stream, oms_ems (OMS+EMS in one process), webgui -> http://127.0.0.1:5000
+scripts/run_all.sh                      # subscriber, trade_stream, oms_ems (OMS lifecycle + EMS execution, one process), webgui -> http://127.0.0.1:5000
 cd generated && python cli.py health && python cli.py twap BTC/USD buy 0.0002 --duration 60 --slices 2
 python -m pytest -q generated/tests -m "not live"     # offline
 python -m pytest -q generated/tests -m live           # needs creds + Redis + workers

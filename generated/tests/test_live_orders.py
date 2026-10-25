@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 import runtime
-from tests.conftest import db, ensure_worker, safe_limit_buy, wait_until
+from tests.conftest import db, ensure_oms_ems, ensure_worker, safe_limit_buy, wait_until
 
 pytestmark = pytest.mark.live
 
@@ -42,7 +42,7 @@ def test_submit_duplicate_cancel(live_redis):
     import trader
     r = live_redis
     ensure_worker("trade_stream")
-    ensure_worker("oms")
+    ensure_oms_ems()
 
     o = safe_limit_buy("BTC/USD")
     print("placing", o["qty"], "@", o["limit_price"], "bid", o["quote"]["bid_price"])
@@ -94,13 +94,22 @@ def test_submit_duplicate_cancel(live_redis):
         c_row = _row("SELECT * FROM commands WHERE cmd_id=?", (cancel_cmd,))
         assert s_row and s_row["kind"] == "submit" and s_row["client_order_id"] == cid
         assert c_row and c_row["kind"] == "cancel"
+
+        rep_row = wait_until(lambda: _row(
+            "SELECT * FROM trade_events WHERE order_id=? AND event='ems_submitted'", (order_id,)), 20)
+        assert rep_row, "no ems_submitted execution report in trade_events"
+        exch = _row("SELECT COUNT(*) AS n FROM trade_events WHERE order_id=? AND event NOT LIKE 'ems_%'",
+                    (order_id,))
+        assert exch and exch["n"] >= 2, "expected exchange events besides EMS reports"
+        assert not _row("SELECT 1 AS x FROM fills WHERE order_id=?", (order_id,)), \
+            "a non-marketable order must not have fills"
     finally:
         _cleanup(r, order_id, cid)
 
 
 def test_submit_unknown_symbol_rejected(live_redis):
     r = live_redis
-    ensure_worker("oms")
+    ensure_oms_ems()
     cid = runtime.new_client_order_id("tc")
     rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
         "kind": "submit", "account": "paper", "client_order_id": cid, "symbol": "NOPE/XYZ",

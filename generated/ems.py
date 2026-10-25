@@ -1,16 +1,19 @@
-"""Execution Management System worker (algo engine).
+"""EMS -- Execution Management System worker.
 
-- Consumes ``alpaca:ems:requests`` (group ``ems``): create / cancel algo parent orders.
-- ``tick`` drives every pending/running algo: refreshes child state from the OMS-owned
-  ``orders``/``fills`` tables, rolls unfilled qty of resting children into the next slice,
-  prices and submits children THROUGH OMS commands (never calls Alpaca order endpoints).
-- Owns SQLite tables ``algo_orders`` and ``algo_slices``. All state needed to resume lives
-  there, so a restart simply continues where it left off. No I/O at import time.
+The ONLY process that calls Alpaca order endpoints (through trader.py). It serves the
+requests OMS forwards on alpaca:ems:requests (submit / cancel_order / create / cancel),
+publishes an EXECUTION REPORT to alpaca:trade_updates for every submit/cancel it performs,
+and runs the algo engine (TWAP) whose state lives in algo_orders / algo_slices.
+
+It never writes the OMS tables (orders, fills, trade_events, commands); it only reads them.
+Nothing here performs I/O at import time.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -18,6 +21,12 @@ from datetime import datetime, timezone
 import algos
 import runtime
 import trader
+
+try:
+    from alpaca.common.exceptions import APIError
+except Exception:  # pragma: no cover
+    class APIError(Exception):
+        pass
 
 NAME = "ems"
 GROUP = "ems"
@@ -38,608 +47,828 @@ CREATE TABLE IF NOT EXISTS algo_slices(
   filled_qty REAL DEFAULT 0, updated_at TEXT, PRIMARY KEY(algo_id, slice_idx));
 """
 
+COID_RE = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
+ACCOUNTS = ("paper", "live")
+RETRY_DELAYS = (0.5, 1.0, 2.0)
+UNKNOWN_LOOKUP_AFTER_S = 10.0
+FINAL_GRACE_S = 5.0
+QUOTE_GIVE_UP_AFTER_END_S = 60.0
 ALGO_ACTIVE = ("pending", "running")
 ALGO_TERMINAL = frozenset({"completed", "partial", "cancelled", "failed"})
 SLICE_TERMINAL = frozenset({"filled", "rolled", "cancelled", "failed"})
 SLICE_OPEN = ("submitted", "working")
-LOOKUP_AFTER_S = 10.0
-LOOKUP_GIVE_UP_S = 120.0
-RULES_TTL_S = 300.0
 
-_rules_cache: dict = {}
-_warn_last: dict = {}
+_last_lookup: dict = {}
 
 
-# --------------------------------------------------------------------------- helpers
 def setup_db(conn) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
 
 
+# --------------------------------------------------------------------------- helpers
 def _f(x):
     if x is None or x == "":
         return None
     try:
-        return float(x)
+        v = float(x)
     except (TypeError, ValueError):
         return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return v
 
 
 def _iso(ts: float) -> str:
-    return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat(timespec="milliseconds")
 
 
-def _parse_ts(s) -> float | None:
-    if s is None or s == "":
-        return None
-    if isinstance(s, (int, float)):
-        return float(s)
+def _ts(v) -> float:
+    """ISO string or epoch (str/float) -> epoch seconds. Unparseable -> 0."""
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
     try:
         return float(s)
-    except (TypeError, ValueError):
+    except ValueError:
         pass
     try:
-        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d.timestamp()
-    except (TypeError, ValueError):
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _s(x):
+    if x is None:
+        return None
+    v = getattr(x, "value", x)
+    v = str(v).strip()
+    if "." in v and v.split(".", 1)[0][:1].isupper() and not v.replace(".", "").isdigit():
+        v = v.rsplit(".", 1)[-1]
+    return v.lower() or None
+
+
+def _rows(conn, sql, params=()):
+    cur = conn.execute(sql, params)
+    out = []
+    cols = [d[0] for d in cur.description] if cur.description else []
+    for row in cur.fetchall():
+        out.append(dict(row) if isinstance(row, sqlite3.Row) else dict(zip(cols, row)))
+    return out
+
+
+def _row(conn, sql, params=()):
+    rs = _rows(conn, sql, params)
+    return rs[0] if rs else None
+
+
+def _oms_rows(conn, sql, params=()):
+    """Read an OMS-owned table; missing table -> []."""
+    try:
+        return _rows(conn, sql, params)
+    except sqlite3.OperationalError as e:
+        log.debug("oms table read failed: %s", e)
+        return []
+
+
+def _order_row(conn, col, val):
+    if not val or col not in ("order_id", "client_order_id"):
+        return None
+    rs = _oms_rows(conn, f"SELECT * FROM orders WHERE {col}=?", (str(val),))
+    return rs[0] if rs else None
+
+
+def _status_code(e):
+    try:
+        sc = e.status_code
+        return int(sc) if sc is not None else None
+    except Exception:
         return None
 
 
-def _row(row):
-    if row is None:
-        return None
-    return {k: row[k] for k in row.keys()}
+def _is_api_error(e) -> bool:
+    return isinstance(e, APIError) or _status_code(e) is not None
 
 
-def _warn_throttled(key: str, msg: str, *args, every: float = 30.0) -> None:
-    now = time.monotonic()
-    if now - _warn_last.get(key, -1e9) >= every:
-        _warn_last[key] = now
-        log.warning(msg, *args)
+def _err_text(e) -> str:
+    if e is None:
+        return "unknown error"
+    msg = None
+    try:
+        info = trader.error_info(e)
+        msg = info.get("message")
+    except Exception:
+        msg = None
+    msg = msg or str(e)
+    sc = _status_code(e) if _is_api_error(e) else None
+    prefix = f"{type(e).__name__}" + (f" {sc}" if sc else "")
+    return f"{prefix}: {str(msg)[:500]}"
 
 
-def coid_for(algo_id: str, idx: int) -> str:
-    return f"algo-{algo_id[:12]}-{int(idx):03d}"
+def _is_dup_coid(e) -> bool:
+    if _status_code(e) != 422:
+        return False
+    text = (str(e) + " " + _err_text(e)).lower()
+    return "client_order_id" in text
 
 
-def get_algo(conn, algo_id):
-    return _row(conn.execute("SELECT * FROM algo_orders WHERE algo_id=?", (algo_id,)).fetchone())
+def _is_transient(e) -> bool:
+    try:
+        return bool(trader.is_transient(e))
+    except Exception:
+        return False
 
 
-def get_slices(conn, algo_id) -> list:
-    return [_row(x) for x in conn.execute(
-        "SELECT * FROM algo_slices WHERE algo_id=? ORDER BY slice_idx", (algo_id,)).fetchall()]
-
-
-def _set_algo(conn, algo_id, **fields) -> None:
-    fields["updated_at"] = runtime.now_iso()
-    cols = ", ".join(f"{k}=?" for k in fields)
-    conn.execute(f"UPDATE algo_orders SET {cols} WHERE algo_id=?", (*fields.values(), algo_id))
-
-
-def _set_slice(conn, algo_id, idx, **fields) -> None:
+def _upd_slice(conn, algo_id, idx, **fields) -> None:
     fields["updated_at"] = runtime.now_iso()
     cols = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE algo_slices SET {cols} WHERE algo_id=? AND slice_idx=?",
-                 (*fields.values(), algo_id, int(idx)))
+                 [*fields.values(), algo_id, int(idx)])
 
 
-def _algo_view(conn, algo_id):
-    a = get_algo(conn, algo_id)
-    if a is None:
-        return None
-    a["slices"] = get_slices(conn, algo_id)
-    return a
+def _upd_algo(conn, algo_id, **fields) -> None:
+    fields["updated_at"] = runtime.now_iso()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE algo_orders SET {cols} WHERE algo_id=?", [*fields.values(), algo_id])
 
 
-def _rules(symbol: str, live: bool, r) -> algos.AssetRules:
-    key = (symbol, bool(live))
-    hit = _rules_cache.get(key)
-    if hit and time.monotonic() - hit[0] < RULES_TTL_S:
-        return hit[1]
+def _get_algo(conn, algo_id):
+    return _row(conn, "SELECT * FROM algo_orders WHERE algo_id=?", (algo_id,))
+
+
+def _get_slices(conn, algo_id):
+    return _rows(conn, "SELECT * FROM algo_slices WHERE algo_id=? ORDER BY slice_idx", (algo_id,))
+
+
+def _strategy_for(algo):
+    params = {}
     try:
-        rules = algos.rules_from_dict(trader.get_asset_rules(symbol, live, r=r))
+        params = json.loads(algo.get("params_json") or "{}") or {}
+    except Exception:
+        params = {}
+    return algos.get_strategy(algo.get("strategy") or "twap", params)
+
+
+def _rules_for(symbol, live, r):
+    try:
+        return algos.rules_from_dict(trader.get_asset_rules(symbol, live, r=r))
     except Exception as e:
-        log.warning("asset rules for %s unavailable: %s", symbol, e)
+        log.warning("asset rules unavailable for %s: %s", symbol, str(e)[:200])
         return algos.AssetRules()
-    _rules_cache[key] = (time.monotonic(), rules)
-    return rules
 
 
-def _send_reply(r, rid, reply) -> None:
-    if r is None or not rid:
-        return
+# --------------------------------------------------------------------------- execution gateway
+def publish_report(r, event: str, order, *, account, client_order_id=None, order_id=None,
+                   symbol=None, side=None, qty=None, source=None, algo_id=None,
+                   slice_idx=None) -> None:
     try:
-        runtime.redis_call(runtime.send_reply, r, str(rid), reply)
+        if r is None:
+            return
+        o = order if isinstance(order, dict) else None
+        if o:
+            order_id = order_id or o.get("id") or o.get("order_id")
+            client_order_id = client_order_id or o.get("client_order_id")
+            symbol = symbol or o.get("symbol")
+            side = side or _s(o.get("side"))
+            if qty is None:
+                qty = _f(o.get("qty"))
+        payload = {
+            "event": event, "execution_id": None,
+            "order_id": str(order_id) if order_id else None,
+            "client_order_id": client_order_id, "symbol": symbol, "side": side,
+            "price": None, "qty": qty, "position_qty": None, "ts": runtime.now_iso(),
+            "account": account or "paper", "order": o, "source": source,
+            "algo_id": algo_id, "slice_idx": slice_idx,
+        }
+        runtime.redis_call(r.xadd, runtime.STREAM_TRADE_UPDATES,
+                           {"json": json.dumps(payload, default=str)},
+                           maxlen=100000, approximate=True)
     except Exception as e:
-        log.error("reply send failed for %s: %s", rid, e)
+        log.error("publish_report %s failed order=%s coid=%s: %s", event, order_id,
+                  client_order_id, e)
 
 
-def _oms_cancel(r, account, client_order_id, order_id=None, timeout=10.0) -> dict:
-    payload = {"cmd_id": runtime.new_id(), "kind": "cancel", "account": account,
-               "client_order_id": client_order_id, "source": "ems"}
-    if order_id:
-        payload["order_id"] = order_id
+def execute_submit(conn, r, p: dict) -> dict:
+    p = dict(p or {})
+    coid = str(p.get("client_order_id") or "")
+    account = str(p.get("account") or "paper").lower()
+    symbol = p.get("symbol")
+    side = str(p.get("side") or "").lower()
+    otype = str(p.get("type") or "market").lower()
+    tif = str(p.get("tif") or "gtc").lower()
+    qty = _f(p.get("qty"))
+    lp = _f(p.get("limit_price"))
+    source = p.get("source")
+    algo_id = p.get("algo_id")
+    slice_idx = p.get("slice_idx")
+
+    def out(ok, status, order=None, order_id=None, error=None):
+        oid = order_id or ((order or {}).get("id") if isinstance(order, dict) else None)
+        return {"ok": bool(ok), "status": status, "order_id": str(oid) if oid else None,
+                "client_order_id": coid or None, "order": order, "error": error}
+
+    err = None
+    if not COID_RE.match(coid):
+        err = "client_order_id missing or invalid (^[A-Za-z0-9_-]{1,48}$)"
+    elif account not in ACCOUNTS:
+        err = f"invalid account {account!r}"
+    elif not symbol or not isinstance(symbol, str):
+        err = "symbol required"
+    elif side not in ("buy", "sell"):
+        err = "side must be buy or sell"
+    elif otype not in ("market", "limit"):
+        err = "type must be market or limit"
+    elif qty is None or qty <= 0:
+        err = "qty must be > 0"
+    elif otype == "limit" and (lp is None or lp <= 0):
+        err = "limit order requires limit_price > 0"
+    elif tif not in ("gtc", "ioc"):
+        err = "tif must be gtc or ioc"
+    if err:
+        log.warning("submit rejected coid=%s: %s", coid, err)
+        return out(False, "rejected", error=err)
+
+    live = account == "live"
+
+    def call():
+        if otype == "limit":
+            return trader.submit_limit(symbol, qty, side, lp, coid, live=live, tif=tif)
+        return trader.submit_market(symbol, qty, side, coid, live=live, tif=tif)
+
+    def found(order, status):
+        if not isinstance(order, dict):
+            order = trader._to_dict(order) if order is not None else {}
+        publish_report(r, "ems_submitted", order, account=account, client_order_id=coid,
+                       source=source, algo_id=algo_id, slice_idx=slice_idx)
+        log.info("submit %s coid=%s %s %s %s @%s -> %s", account, coid, side, qty, symbol, lp,
+                 status)
+        return out(True, status, order=order)
+
+    def lookup():
+        try:
+            return trader.get_order_by_client_id(coid, live)
+        except Exception as le:
+            log.warning("lookup by coid %s failed: %s", coid, str(le)[:200])
+            return None
+
+    last = None
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            order = call()
+        except Exception as e:
+            if _is_dup_coid(e):
+                existing = lookup()
+                if existing:
+                    return found(existing, "already_submitted")
+                return out(False, "rejected", error=_err_text(e))
+            if _is_transient(e):
+                last = e
+                if attempt < len(RETRY_DELAYS):
+                    log.warning("transient submit error coid=%s (attempt %d): %s", coid,
+                                attempt + 1, str(e)[:200])
+                    time.sleep(RETRY_DELAYS[attempt])
+                    continue
+                break
+            if _is_api_error(e):
+                log.warning("submit rejected by API coid=%s: %s", coid, _err_text(e))
+                return out(False, "rejected", error=_err_text(e))
+            log.warning("submit error coid=%s: %s", coid, _err_text(e))
+            return out(False, "error", error=_err_text(e))
+        return found(order, "acked")
+
+    existing = lookup()
+    if existing:
+        return found(existing, "acked")
+    log.error("submit outcome unknown coid=%s: %s", coid, _err_text(last))
+    return out(False, "unknown", error=_err_text(last))
+
+
+def execute_cancel(conn, r, p: dict) -> dict:
+    p = dict(p or {})
+    oid = str(p["order_id"]) if p.get("order_id") else None
+    coid = str(p["client_order_id"]) if p.get("client_order_id") else None
+    account = p.get("account")
+    source = p.get("source")
+
+    def out(ok, status, error=None):
+        return {"ok": bool(ok), "status": status, "order_id": oid, "client_order_id": coid,
+                "error": error}
+
+    row = _order_row(conn, "order_id", oid) if oid else None
+    if row is None and coid:
+        row = _order_row(conn, "client_order_id", coid)
+    if row:
+        oid = oid or row.get("order_id")
+        coid = coid or row.get("client_order_id")
+        account = account or row.get("account")
+    account = str(account or "paper").lower()
+    live = account == "live"
+    order = None
+    if row:
+        order = {k: v for k, v in row.items() if k not in ("raw_json", "status")}
+    if not oid and coid:
+        try:
+            o = trader.get_order_by_client_id(coid, live)
+        except Exception as e:
+            return out(False, "error", _err_text(e))
+        if o:
+            order = o
+            oid = str(o.get("id") or o.get("order_id") or "") or None
+    if not oid:
+        return out(False, "not_found", "order not found")
     try:
-        return runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload, timeout=timeout)
+        trader.cancel(oid, live)
     except Exception as e:
-        return {"ok": False, "status": "error", "error": f"{type(e).__name__}: {e}"}
-
-
-def _map_slice_status(order_status, current: str) -> str:
-    if current in SLICE_TERMINAL:
-        return current
-    st = (order_status or "").lower()
-    if st == "filled":
-        return "filled"
-    if st in runtime.ACTIVE_STATUSES:
-        return "working"
-    if st in ("canceled", "replaced", "done_for_day"):
-        return "cancelled"
-    if st in ("rejected", "expired", "suspended", "stopped"):
-        return "failed"
-    return current
+        sc = _status_code(e)
+        text = _err_text(e)
+        if sc in (404, 422) or (_is_api_error(e) and "not found" in text.lower()):
+            log.info("cancel %s: not found / not cancelable: %s", oid, text)
+            return out(False, "not_found", text)
+        log.warning("cancel %s failed: %s", oid, text)
+        return out(False, "error", text)
+    publish_report(r, "ems_cancel_requested", order, account=account, order_id=oid,
+                   client_order_id=coid, source=source)
+    log.info("cancel requested %s order=%s coid=%s", account, oid, coid)
+    return out(True, "cancel_requested")
 
 
 # --------------------------------------------------------------------------- requests
-def _reply(rid, *, ok, status=None, algo_id=None, error=None, algo=None) -> dict:
-    return {"ok": bool(ok), "req_id": rid, "cmd_id": rid, "algo_id": algo_id, "status": status,
-            "error": error, "algo": algo}
+def _algo_out(ok, status, algo_id=None, algo=None, error=None, **extra):
+    d = {"ok": bool(ok), "status": status, "algo_id": algo_id, "algo": algo, "error": error}
+    d.update(extra)
+    return d
 
 
-def _create(conn, r, rid, p) -> dict:
-    strategy = str(p.get("strategy") or "twap").strip().lower()
-    cls = algos.REGISTRY.get(strategy)
+def _create_algo(conn, r, p: dict) -> dict:
+    def rej(msg):
+        log.warning("algo create rejected: %s", msg)
+        return _algo_out(False, "rejected", error=msg)
+
+    strategy_id = str(p.get("strategy") or "twap").strip().lower()
+    cls = algos.REGISTRY.get(strategy_id)
     if cls is None:
-        return _reply(rid, ok=False, status="rejected",
-                      error=f"unknown strategy {strategy!r}; valid: {', '.join(algos.REGISTRY)}")
+        return rej(f"unknown strategy {strategy_id!r}; valid: {', '.join(algos.REGISTRY)}")
     if not getattr(cls, "available", False):
-        return _reply(rid, ok=False, status="rejected",
-                      error=f"strategy {strategy!r} not available: {getattr(cls, 'note', '')}")
-    account = str(p.get("account") or "paper").strip().lower()
-    if account not in ("paper", "live"):
-        return _reply(rid, ok=False, status="rejected", error="account must be paper or live")
-    symbol = str(p.get("symbol") or "").strip().upper()
-    if not symbol:
-        return _reply(rid, ok=False, status="rejected", error="symbol required")
-    side = str(p.get("side") or "").strip().lower()
+        return rej(f"strategy {strategy_id!r} not available: {getattr(cls, 'note', '')}")
+    side = str(p.get("side") or "").lower()
     if side not in ("buy", "sell"):
-        return _reply(rid, ok=False, status="rejected", error="side must be buy or sell")
+        return rej("side must be buy or sell")
     total_qty = _f(p.get("total_qty"))
     if total_qty is None or total_qty <= 0:
-        return _reply(rid, ok=False, status="rejected", error="total_qty must be > 0")
+        return rej("total_qty must be > 0")
+    account = str(p.get("account") or "paper").lower()
+    if account not in ACCOUNTS:
+        return rej(f"invalid account {account!r}")
+    symbol = p.get("symbol")
+    if not symbol or not isinstance(symbol, str):
+        return rej("symbol required")
+    symbol = symbol.strip().upper()
     try:
-        n_slices = int(p.get("n_slices") if p.get("n_slices") not in (None, "") else 5)
-        duration_s = float(p.get("duration_s") if p.get("duration_s") not in (None, "") else 300)
+        n_slices = int(p.get("n_slices") or 5)
     except (TypeError, ValueError):
-        return _reply(rid, ok=False, status="rejected", error="n_slices/duration_s must be numbers")
+        return rej("n_slices must be an integer")
     if n_slices < 1:
-        return _reply(rid, ok=False, status="rejected", error="n_slices must be >= 1")
-    if duration_s < algos.MIN_INTERVAL_S * n_slices:
-        return _reply(rid, ok=False, status="rejected",
-                      error=f"duration_s must be >= {algos.MIN_INTERVAL_S:.0f}*n_slices "
-                            f"({algos.MIN_INTERVAL_S * n_slices:.0f}s)")
-    limit_cap = _f(p.get("limit_cap"))
-    if p.get("limit_cap") not in (None, "") and (limit_cap is None or limit_cap <= 0):
-        return _reply(rid, ok=False, status="rejected", error="limit_cap must be > 0")
+        return rej("n_slices must be >= 1")
+    duration_s = _f(p.get("duration_s")) if p.get("duration_s") not in (None, "") else 300.0
+    if duration_s is None or duration_s <= 0:
+        return rej("duration_s must be > 0")
+    if duration_s < 10 * n_slices:
+        return rej(f"duration_s must be >= 10*n_slices ({10 * n_slices}s)")
+    limit_cap = None
+    if p.get("limit_cap") not in (None, ""):
+        limit_cap = _f(p.get("limit_cap"))
+        if limit_cap is None or limit_cap <= 0:
+            return rej("limit_cap must be > 0")
     params = p.get("params") or {}
     if isinstance(params, str):
         try:
-            params = json.loads(params) or {}
+            params = json.loads(params) if params.strip() else {}
         except ValueError:
-            return _reply(rid, ok=False, status="rejected", error="params must be a JSON object")
+            return rej("params must be a JSON object")
     if not isinstance(params, dict):
-        return _reply(rid, ok=False, status="rejected", error="params must be an object")
+        return rej("params must be an object")
     live = account == "live"
     try:
-        rules = algos.rules_from_dict(trader.get_asset_rules(symbol, live, r=r))
+        rules_d = trader.get_asset_rules(symbol, live, r=r)
     except Exception as e:
-        log.warning("asset rules for %s unavailable: %s", symbol, e)
-        rules = algos.AssetRules()
+        log.warning("asset rules unavailable for %s: %s", symbol, str(e)[:200])
+        rules_d = None
+    if isinstance(rules_d, dict) and rules_d.get("tradable") is False:
+        return rej(f"{symbol} is not tradable")
+    rules = algos.rules_from_dict(rules_d)
     start = runtime.utc_ts() + 2
     end = start + duration_s
     try:
-        slices = algos.build_schedule(strategy, total_qty, start, end, n_slices, rules, params)
+        slices = algos.build_schedule(strategy_id, total_qty, start, end, n_slices, rules, params)
     except (ValueError, NotImplementedError) as e:
-        return _reply(rid, ok=False, status="rejected", error=str(e))
+        return rej(str(e))
     if not slices:
-        return _reply(rid, ok=False, status="rejected", error="empty schedule")
+        return rej("empty schedule")
+    total_r = algos.round_qty(total_qty, rules.min_trade_increment)
     algo_id = runtime.new_id()
     now = runtime.now_iso()
-    if live:
-        log.warning("LIVE algo %s requested", algo_id)
     conn.execute(
-        "INSERT INTO algo_orders(algo_id, strategy, account, symbol, side, total_qty, n_slices, "
-        "start_ts, end_ts, limit_cap, params_json, source, status, filled_qty, avg_px, error, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (algo_id, strategy, account, symbol, side, float(sum(s.qty for s in slices)), len(slices),
-         _iso(start), _iso(end), limit_cap, json.dumps(params, default=str), p.get("source"),
-         "pending", 0.0, None, None, now, now))
+        "INSERT INTO algo_orders(algo_id, strategy, account, symbol, side, total_qty, n_slices,"
+        " start_ts, end_ts, limit_cap, params_json, source, status, filled_qty, avg_px, error,"
+        " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (algo_id, strategy_id, account, symbol, side, total_r, len(slices), _iso(start),
+         _iso(end), limit_cap, json.dumps(params, default=str), p.get("source"), "pending", 0.0,
+         None, None, now, now))
     for s in slices:
         conn.execute(
-            "INSERT OR IGNORE INTO algo_slices(algo_id, slice_idx, scheduled_ts, qty, client_order_id, "
-            "order_id, limit_price, status, filled_qty, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (algo_id, s.idx, _iso(s.scheduled_ts), s.qty, coid_for(algo_id, s.idx), None, None,
-             "scheduled", 0.0, now))
+            "INSERT INTO algo_slices(algo_id, slice_idx, scheduled_ts, qty, client_order_id,"
+            " order_id, limit_price, status, filled_qty, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (algo_id, int(s.idx), _iso(s.scheduled_ts), float(s.qty),
+             f"algo-{algo_id[:12]}-{int(s.idx):03d}", None, None, "scheduled", 0.0, now))
     conn.commit()
-    log.info("algo %s created %s %s %s %s qty=%s slices=%d duration=%.0fs cap=%s", algo_id, strategy,
-             account, symbol, side, total_qty, len(slices), duration_s, limit_cap)
-    return _reply(rid, ok=True, status="pending", algo_id=algo_id, algo=_algo_view(conn, algo_id))
+    algo = _get_algo(conn, algo_id)
+    log.info("algo %s created %s %s %s %s over %.0fs in %d slices (%s)", algo_id, strategy_id,
+             side, total_r, symbol, duration_s, len(slices), account)
+    return _algo_out(True, "pending", algo_id=algo_id, algo=algo,
+                     slices=_get_slices(conn, algo_id))
 
 
-def _cancel(conn, r, rid, p) -> dict:
-    algo_id = p.get("algo_id")
-    algo = get_algo(conn, algo_id) if algo_id else None
-    if algo is None:
-        return _reply(rid, ok=False, status="not_found", algo_id=algo_id, error="algo not found")
-    if algo["status"] in ALGO_TERMINAL:
-        return _reply(rid, ok=True, status=algo["status"], algo_id=algo_id,
-                      algo=_algo_view(conn, algo_id))
-    errors = _cancel_children(conn, r, algo)
-    _set_algo(conn, algo_id, status="cancelled", error="; ".join(errors)[:500] if errors else None)
-    conn.commit()
-    log.info("algo %s cancelled (child cancel errors=%d)", algo_id, len(errors))
-    return _reply(rid, ok=True, status="cancelled", algo_id=algo_id,
-                  error="; ".join(errors)[:500] if errors else None, algo=_algo_view(conn, algo_id))
-
-
-def _cancel_children(conn, r, algo, timeout=10.0) -> list:
-    """Cancel open children via OMS and scheduled slices locally. Returns error strings."""
-    algo_id = algo["algo_id"]
-    errors = []
-    oms_up = r is not None and runtime.worker_alive(r, "oms") is not None
-    for s in get_slices(conn, algo_id):
-        if s["status"] == "scheduled":
-            _set_slice(conn, algo_id, s["slice_idx"], status="cancelled")
-        elif s["status"] in SLICE_OPEN:
-            if not oms_up:
-                errors.append(f"slice {s['slice_idx']}: OMS unavailable, child may remain open")
+def _cancel_open_slices(conn, r, algo, slices, mark="cancelled") -> None:
+    for s in slices:
+        st = s.get("status")
+        if st in SLICE_OPEN:
+            res = execute_cancel(conn, r, {"account": algo.get("account"),
+                                           "order_id": s.get("order_id"),
+                                           "client_order_id": s.get("client_order_id"),
+                                           "source": "ems"})
+            if res.get("status") in ("cancel_requested", "not_found"):
+                _upd_slice(conn, algo["algo_id"], s["slice_idx"], status=mark)
             else:
-                rep = _oms_cancel(r, algo["account"], s["client_order_id"], s["order_id"], timeout)
-                if not rep.get("ok") and rep.get("status") != "not_found":
-                    errors.append(f"slice {s['slice_idx']}: {rep.get('status')} {rep.get('error')}")
-            _set_slice(conn, algo_id, s["slice_idx"], status="cancelled")
-    return errors
+                log.warning("algo %s slice %s cancel failed: %s", algo["algo_id"],
+                            s["slice_idx"], res.get("error"))
+        elif st == "scheduled":
+            _upd_slice(conn, algo["algo_id"], s["slice_idx"], status=mark)
+
+
+def _cancel_algo(conn, r, p: dict) -> dict:
+    algo_id = p.get("algo_id")
+    if not algo_id:
+        return _algo_out(False, "rejected", error="algo_id required")
+    algo_id = str(algo_id)
+    algo = _get_algo(conn, algo_id)
+    if algo is None:
+        return _algo_out(False, "not_found", algo_id=algo_id, error="algo not found")
+    st = algo.get("status")
+    if st == "cancelled":
+        return _algo_out(True, "cancelled", algo_id=algo_id, algo=algo)
+    if st in ALGO_TERMINAL:
+        return _algo_out(False, st, algo_id=algo_id, algo=algo, error=f"algo already {st}")
+    try:
+        refresh_from_oms(conn, algo_id)
+    except Exception as e:
+        log.warning("refresh before cancel failed for %s: %s", algo_id, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    _upd_algo(conn, algo_id, status="cancelled")
+    conn.commit()
+    _cancel_open_slices(conn, r, algo, _get_slices(conn, algo_id), mark="cancelled")
+    conn.commit()
+    algo = _get_algo(conn, algo_id)
+    log.info("algo %s cancelled", algo_id)
+    return _algo_out(True, "cancelled", algo_id=algo_id, algo=algo)
 
 
 def handle_request(conn, r, payload: dict) -> dict:
-    if not isinstance(payload, dict):
-        payload = {}
-    rid = str(payload.get("req_id") or payload.get("cmd_id") or runtime.new_id())
-    kind = str(payload.get("kind") or "").strip().lower()
-    if kind == "create":
-        reply = _create(conn, r, rid, payload)
-    elif kind == "cancel":
-        reply = _cancel(conn, r, rid, payload)
-    else:
-        reply = _reply(rid, ok=False, status="rejected", error=f"unknown kind {kind!r}")
-    conn.commit()
-    _send_reply(r, rid, reply)
+    payload = dict(payload or {})
+    cmd_id = payload.get("cmd_id") or payload.get("req_id")
+    kind = payload.get("kind")
+    try:
+        if kind == "submit":
+            reply = execute_submit(conn, r, payload)
+        elif kind == "cancel_order":
+            reply = execute_cancel(conn, r, payload)
+        elif kind == "create":
+            reply = _create_algo(conn, r, payload)
+        elif kind == "cancel":
+            reply = _cancel_algo(conn, r, payload)
+        else:
+            reply = {"ok": False, "status": "rejected", "error": f"unknown kind {kind!r}"}
+    except Exception as e:
+        log.exception("request %s (%s) failed", cmd_id, kind)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        reply = {"ok": False, "status": "error", "error": f"{type(e).__name__}: {e}"}
+        if kind in ("create", "cancel"):
+            reply.update({"algo_id": payload.get("algo_id"), "algo": None})
+        else:
+            reply.update({"order_id": payload.get("order_id"),
+                          "client_order_id": payload.get("client_order_id"), "order": None})
+    reply = dict(reply)
+    reply["cmd_id"] = cmd_id
+    if r is not None and cmd_id:
+        try:
+            runtime.redis_call(runtime.send_reply, r, str(cmd_id), reply)
+        except Exception as e:
+            log.error("send_reply failed cmd=%s: %s", cmd_id, e)
+    log.info("req %s kind=%s -> %s %s", str(cmd_id)[:12], kind, reply.get("status"),
+             reply.get("error") or "")
     return reply
 
 
-# --------------------------------------------------------------------------- refresh
+# --------------------------------------------------------------------------- algo engine
+def _slice_status_from_order(cur, ost):
+    if cur in ("rolled", "cancelled", "filled"):
+        return cur
+    if not ost:
+        return cur
+    if ost == "filled":
+        return "filled"
+    if ost in runtime.ACTIVE_STATUSES:
+        return "working"
+    if ost in ("rejected", "expired"):
+        return "failed"
+    if ost == "canceled":
+        return "cancelled"
+    return cur
+
+
 def refresh_from_oms(conn, algo_id) -> None:
-    slices = get_slices(conn, algo_id)
+    slices = _get_slices(conn, algo_id)
     if not slices:
         return
-    by_coid = {s["client_order_id"]: s for s in slices if s["client_order_id"]}
-    by_idx = {s["slice_idx"]: s for s in slices}
-    prefix = algo_id[:12]
-    coids = list(by_coid)
-    try:
-        q = "SELECT * FROM orders WHERE "
-        args: list = []
-        if coids:
-            q += f"client_order_id IN ({','.join('?' * len(coids))}) OR "
-            args += coids
-        q += "algo_id LIKE ?"
-        args.append(prefix + "%")
-        rows = [_row(x) for x in conn.execute(q, args).fetchall()]
-    except sqlite3.OperationalError as e:
-        log.debug("refresh %s: orders table unavailable: %s", algo_id, e)
-        return
+    coids = [s["client_order_id"] for s in slices if s.get("client_order_id")]
+    rows = []
+    if coids:
+        qs = ",".join("?" for _ in coids)
+        rows = _oms_rows(conn, f"SELECT * FROM orders WHERE client_order_id IN ({qs})", coids)
+    by_coid = {r_["client_order_id"]: r_ for r_ in rows if r_.get("client_order_id")}
+    by_idx = {}
+    if not rows:
+        fb = _oms_rows(conn, "SELECT * FROM orders WHERE algo_id LIKE ?", (algo_id[:12] + "%",))
+        for r_ in fb:
+            if r_.get("slice_idx") is not None:
+                by_idx[int(r_["slice_idx"])] = r_
     order_ids = []
-    seen = set()
-    for o in rows:
-        s = by_coid.get(o.get("client_order_id"))
-        if s is None:
-            coid = o.get("client_order_id") or ""
-            if not coid.startswith(f"algo-{prefix}-"):
-                continue
-            s = by_idx.get(o.get("slice_idx"))
-        if s is None or s["slice_idx"] in seen:
+    for s in slices:
+        row = by_coid.get(s.get("client_order_id")) or by_idx.get(int(s["slice_idx"]))
+        if row is None:
+            if s.get("order_id"):
+                order_ids.append(s["order_id"])
             continue
-        seen.add(s["slice_idx"])
-        if o.get("order_id"):
-            order_ids.append(o["order_id"])
-        filled = max(_f(o.get("filled_qty")) or 0.0, _f(s.get("filled_qty")) or 0.0)
-        new_status = _map_slice_status(o.get("status"), s["status"])
-        if (new_status != s["status"] or o.get("order_id") != s["order_id"]
-                or abs(filled - (_f(s["filled_qty"]) or 0.0)) > 1e-12):
-            _set_slice(conn, algo_id, s["slice_idx"], order_id=o.get("order_id") or s["order_id"],
-                       filled_qty=filled, status=new_status)
-    slices = get_slices(conn, algo_id)
-    filled_total = sum(_f(s["filled_qty"]) or 0.0 for s in slices)
+        oid = row.get("order_id") or s.get("order_id")
+        if oid:
+            order_ids.append(oid)
+        filled = _f(row.get("filled_qty"))
+        filled = filled if filled is not None else (_f(s.get("filled_qty")) or 0.0)
+        filled = max(filled, _f(s.get("filled_qty")) or 0.0)
+        new_st = _slice_status_from_order(s.get("status"), _s(row.get("status")))
+        if (oid != s.get("order_id") or abs(filled - (_f(s.get("filled_qty")) or 0.0)) > 1e-15
+                or new_st != s.get("status")):
+            _upd_slice(conn, algo_id, s["slice_idx"], order_id=oid, filled_qty=filled,
+                       status=new_st)
+    slices = _get_slices(conn, algo_id)
+    total_filled = sum(_f(s.get("filled_qty")) or 0.0 for s in slices)
     avg_px = None
     if order_ids:
-        ph = ",".join("?" * len(order_ids))
-        try:
-            row = conn.execute(f"SELECT SUM(price*qty) AS n, SUM(qty) AS q FROM fills "
-                               f"WHERE order_id IN ({ph}) AND price IS NOT NULL AND qty > 0",
-                               order_ids).fetchone()
-            if row is not None and row["q"]:
-                avg_px = row["n"] / row["q"]
-        except sqlite3.OperationalError:
-            pass
-        if avg_px is None:
-            row = conn.execute(f"SELECT SUM(filled_avg_price*filled_qty) AS n, SUM(filled_qty) AS q "
-                               f"FROM orders WHERE order_id IN ({ph}) AND filled_avg_price IS NOT NULL "
-                               f"AND filled_qty > 0", order_ids).fetchone()
-            if row is not None and row["q"]:
-                avg_px = row["n"] / row["q"]
-    a = get_algo(conn, algo_id)
-    if a is not None and (abs((_f(a["filled_qty"]) or 0.0) - filled_total) > 1e-12
-                          or (avg_px is not None and a["avg_px"] != avg_px)):
-        _set_algo(conn, algo_id, filled_qty=filled_total,
-                  avg_px=avg_px if avg_px is not None else a["avg_px"])
+        qs = ",".join("?" for _ in order_ids)
+        fills = _oms_rows(conn, f"SELECT price, qty FROM fills WHERE order_id IN ({qs})",
+                          order_ids)
+        pq = sum((_f(f_["price"]) or 0.0) * (_f(f_["qty"]) or 0.0) for f_ in fills
+                 if _f(f_["price"]) and _f(f_["qty"]))
+        q = sum(_f(f_["qty"]) or 0.0 for f_ in fills if _f(f_["price"]) and _f(f_["qty"]))
+        if q > 0:
+            avg_px = pq / q
+        else:
+            ords = _oms_rows(conn, f"SELECT filled_qty, filled_avg_price FROM orders"
+                                   f" WHERE order_id IN ({qs})", order_ids)
+            pq = sum((_f(o["filled_qty"]) or 0.0) * (_f(o["filled_avg_price"]) or 0.0)
+                     for o in ords if _f(o["filled_avg_price"]))
+            q = sum(_f(o["filled_qty"]) or 0.0 for o in ords if _f(o["filled_avg_price"]))
+            if q > 0:
+                avg_px = pq / q
+    algo = _get_algo(conn, algo_id)
+    if algo is not None:
+        old_f = _f(algo.get("filled_qty")) or 0.0
+        old_px = _f(algo.get("avg_px"))
+        if abs(old_f - total_filled) > 1e-15 or (avg_px is not None and avg_px != old_px):
+            _upd_algo(conn, algo_id, filled_qty=total_filled,
+                      avg_px=avg_px if avg_px is not None else old_px)
     conn.commit()
 
 
-def _order_active(conn, order_id) -> bool:
-    if not order_id:
-        return False
-    try:
-        row = conn.execute("SELECT status FROM orders WHERE order_id=?", (order_id,)).fetchone()
-    except sqlite3.OperationalError:
-        return False
-    return row is not None and (row["status"] or "") in runtime.ACTIVE_STATUSES
-
-
-# --------------------------------------------------------------------------- tick
-def _fail_algo(conn, r, algo_id, error, allow_cancel=True) -> None:
-    algo = get_algo(conn, algo_id)
-    if algo is None:
-        return
-    errs = []
-    if allow_cancel:
-        try:
-            errs = _cancel_children(conn, r, algo, timeout=5.0)
-        except Exception as e:
-            errs = [f"child cancel failed: {e}"]
-    else:
-        conn.execute("UPDATE algo_slices SET status='cancelled', updated_at=? "
-                     "WHERE algo_id=? AND status='scheduled'", (runtime.now_iso(), algo_id))
-    text = str(error) + (("; " + "; ".join(errs)) if errs else "")
-    _set_algo(conn, algo_id, status="failed", error=text[:1000])
-    conn.commit()
-    log.error("algo %s failed: %s", algo_id, text)
-
-
-def _resolve_unknown(conn, r, algo, slices, now) -> bool:
-    """Slices stuck in 'submitted' without an order row: look up by client id. False => algo failed."""
-    live = algo["account"] == "live"
+def _resolve_unknown(conn, r, algo, slices, now) -> None:
+    """Slices whose OMS orders row is still missing >10s after submission: ask Alpaca."""
+    live = algo.get("account") == "live"
     for s in slices:
-        if s["status"] != "submitted" or s["order_id"]:
+        if s.get("status") not in SLICE_OPEN:
             continue
-        age = now - (_parse_ts(s["updated_at"]) or now)
-        if age < LOOKUP_AFTER_S:
+        coid = s.get("client_order_id")
+        if not coid or _order_row(conn, "client_order_id", coid) is not None:
             continue
+        if now - _ts(s.get("updated_at")) < UNKNOWN_LOOKUP_AFTER_S:
+            continue
+        mono = time.monotonic()
+        if mono - _last_lookup.get(coid, -1e18) < UNKNOWN_LOOKUP_AFTER_S:
+            continue
+        _last_lookup[coid] = mono
         try:
-            found = trader.get_order_by_client_id(s["client_order_id"], live=live)
+            o = trader.get_order_by_client_id(coid, live)
         except Exception as e:
-            _warn_throttled(f"lookup:{s['client_order_id']}", "lookup %s failed: %s",
-                            s["client_order_id"], e)
+            log.warning("algo %s slice %s lookup failed: %s", algo["algo_id"], s["slice_idx"],
+                        str(e)[:200])
             continue
-        if found:
-            if not isinstance(found, dict):
-                found = trader._to_dict(found)
-            oid = str(found.get("id") or found.get("order_id") or "") or None
-            st = _map_slice_status(str(found.get("status") or "").lower(), "submitted")
-            conn.execute("UPDATE algo_slices SET order_id=?, filled_qty=?, status=? "
-                         "WHERE algo_id=? AND slice_idx=?",
-                         (oid, _f(found.get("filled_qty")) or 0.0, st, algo["algo_id"], s["slice_idx"]))
+        if o:
+            oid = str(o.get("id") or "") or s.get("order_id")
+            filled = max(_f(o.get("filled_qty")) or 0.0, _f(s.get("filled_qty")) or 0.0)
+            st = _slice_status_from_order(s.get("status"), _s(o.get("status")))
+            _upd_slice(conn, algo["algo_id"], s["slice_idx"], order_id=oid, filled_qty=filled,
+                       status=st)
+            publish_report(r, "ems_submitted", o, account=algo.get("account"),
+                           client_order_id=coid, source="ems", algo_id=algo["algo_id"],
+                           slice_idx=s["slice_idx"])
+            log.info("algo %s slice %s resolved via REST: %s", algo["algo_id"], s["slice_idx"],
+                     st)
+        elif not s.get("order_id"):
+            _upd_slice(conn, algo["algo_id"], s["slice_idx"], status="failed")
+            log.warning("algo %s slice %s (coid %s) never reached the exchange; failed",
+                        algo["algo_id"], s["slice_idx"], coid)
+    conn.commit()
+
+
+def _submit_due(conn, r, algo, slices, due, now, last_idx) -> bool:
+    """Submit the latest due slice (rolling earlier unfilled qty into it).
+
+    Returns True if the algo failed."""
+    algo_id = algo["algo_id"]
+    account = algo.get("account") or "paper"
+    live = account == "live"
+    target = due[-1]
+    tidx = int(target["slice_idx"])
+    tqty = _f(target.get("qty")) or 0.0
+    # 1) roll forward earlier working/submitted slices
+    for s in slices:
+        if int(s["slice_idx"]) >= tidx or s.get("status") not in SLICE_OPEN:
+            continue
+        res = execute_cancel(conn, r, {"account": account, "order_id": s.get("order_id"),
+                                       "client_order_id": s.get("client_order_id"),
+                                       "source": "ems"})
+        if res.get("status") not in ("cancel_requested", "not_found"):
+            log.warning("algo %s: roll cancel of slice %s failed (%s); deferring slice %s",
+                        algo_id, s["slice_idx"], res.get("error"), tidx)
             conn.commit()
-            log.info("algo %s slice %d resolved via lookup order=%s status=%s", algo["algo_id"],
-                     s["slice_idx"], oid, st)
-        elif age >= LOOKUP_GIVE_UP_S:
-            _set_slice(conn, algo["algo_id"], s["slice_idx"], status="failed")
-            _fail_algo(conn, r, algo["algo_id"],
-                       f"slice {s['slice_idx']} ({s['client_order_id']}) not found at broker")
             return False
+        filled = _f(s.get("filled_qty")) or 0.0
+        oid = res.get("order_id") or s.get("order_id")
+        final_status = "rolled"
+        if oid:
+            try:
+                o = trader.get_order(oid, live)
+                if isinstance(o, dict):
+                    filled = max(filled, _f(o.get("filled_qty")) or 0.0)
+                    if _s(o.get("status")) == "filled":
+                        final_status = "filled"
+            except Exception as e:
+                log.debug("get_order %s after cancel failed: %s", oid, e)
+        unfilled = max(0.0, (_f(s.get("qty")) or 0.0) - filled)
+        if final_status == "filled":
+            unfilled = 0.0
+        tqty += unfilled
+        _upd_slice(conn, algo_id, s["slice_idx"], status=final_status, filled_qty=filled,
+                   order_id=oid)
+        _upd_slice(conn, algo_id, tidx, qty=tqty)
+        conn.commit()
+        log.info("algo %s: slice %s %s, rolled %.10g into slice %s", algo_id, s["slice_idx"],
+                 final_status, unfilled, tidx)
+    # 2) missed scheduled slices merge into the target
+    for s in due[:-1]:
+        tqty += _f(s.get("qty")) or 0.0
+        _upd_slice(conn, algo_id, s["slice_idx"], status="rolled")
+        _upd_slice(conn, algo_id, tidx, qty=tqty)
+        conn.commit()
+        log.info("algo %s: missed slice %s merged into slice %s", algo_id, s["slice_idx"], tidx)
+    # 3) price and submit
+    final = tidx == last_idx
+    rules = _rules_for(algo["symbol"], live, r)
+    qty = algos.round_qty(tqty, rules.min_trade_increment)
+    if qty <= 0:
+        _upd_slice(conn, algo_id, tidx, status="cancelled", qty=0.0)
+        conn.commit()
+        return False
+    strategy = _strategy_for(algo)
+    try:
+        quote = trader.latest_quote(algo["symbol"], r=r)
+        px = strategy.child_price(algo["side"], quote, _f(algo.get("limit_cap")), final, rules)
+    except Exception as e:
+        log.warning("algo %s: no usable quote for slice %s: %s", algo_id, tidx, str(e)[:200])
+        if now > _ts(algo.get("end_ts")) + QUOTE_GIVE_UP_AFTER_END_S:
+            raise RuntimeError(f"no usable quote: {e}")
+        return False
+    _upd_slice(conn, algo_id, tidx, qty=qty, limit_price=px)
+    conn.commit()
+    res = execute_submit(conn, r, {
+        "client_order_id": target["client_order_id"], "account": account,
+        "symbol": algo["symbol"], "side": algo["side"], "type": "limit", "qty": qty,
+        "limit_price": px, "tif": "ioc" if final else "gtc", "source": "ems",
+        "algo_id": algo_id, "slice_idx": tidx})
+    st = res.get("status")
+    if st in ("acked", "already_submitted"):
+        _upd_slice(conn, algo_id, tidx, status="submitted", order_id=res.get("order_id"))
+        conn.commit()
+        return False
+    if st == "unknown":
+        _upd_slice(conn, algo_id, tidx, status="submitted")
+        conn.commit()
+        return False
+    err = res.get("error") or st
+    _upd_slice(conn, algo_id, tidx, status="failed")
+    _upd_algo(conn, algo_id, status="failed", error=f"slice {tidx}: {err}"[:1000])
+    conn.commit()
+    log.error("algo %s failed: slice %s %s: %s", algo_id, tidx, st, err)
+    try:
+        _cancel_open_slices(conn, r, algo, _get_slices(conn, algo_id), mark="cancelled")
+        conn.commit()
+    except Exception as e:
+        log.warning("algo %s: cleanup cancel failed: %s", algo_id, e)
     return True
 
 
-def _submit_due(conn, r, algo, now) -> None:
-    algo_id = algo["algo_id"]
-    account = algo["account"]
-    live = account == "live"
-    slices = get_slices(conn, algo_id)
-    last_idx = max(s["slice_idx"] for s in slices)
-    due = [s for s in slices if s["status"] == "scheduled"
-           and (_parse_ts(s["scheduled_ts"]) or 0.0) <= now]
-    if not due:
+def _finalise(conn, r, algo_id, now, last_idx) -> None:
+    algo = _get_algo(conn, algo_id)
+    if algo is None or algo.get("status") not in ALGO_ACTIVE:
         return
-    target = due[-1]
-    tidx = target["slice_idx"]
-    extra = 0.0
-    # slices that became due while we were down: merge into the latest due one
-    for s in due[:-1]:
-        _set_slice(conn, algo_id, s["slice_idx"], status="rolled")
-        extra += max(0.0, (_f(s["qty"]) or 0.0) - (_f(s["filled_qty"]) or 0.0))
-    # roll forward: cancel resting earlier children, add their unfilled qty
-    for s in slices:
-        if s["slice_idx"] >= tidx or s["status"] not in SLICE_OPEN:
-            continue
-        rep = _oms_cancel(r, account, s["client_order_id"], s["order_id"])
-        if rep.get("ok") and rep.get("status") == "cancel_requested":
-            unfilled = max(0.0, (_f(s["qty"]) or 0.0) - (_f(s["filled_qty"]) or 0.0))
-            _set_slice(conn, algo_id, s["slice_idx"], status="rolled")
-            extra += unfilled
-            log.info("algo %s slice %d rolled unfilled=%s into slice %d", algo_id, s["slice_idx"],
-                     unfilled, tidx)
-        else:
-            log.warning("algo %s roll cancel of slice %d -> %s %s", algo_id, s["slice_idx"],
-                        rep.get("status"), rep.get("error"))
-    conn.commit()
+    slices = _get_slices(conn, algo_id)
+    filled = _f(algo.get("filled_qty")) or 0.0
+    total = _f(algo.get("total_qty")) or 0.0
+    done = total > 0 and filled >= total * (1 - 1e-9)
 
-    rules = _rules(algo["symbol"], live, r)
-    slices = get_slices(conn, algo_id)
-    total = _f(algo["total_qty"]) or 0.0
-    filled_total = sum(_f(s["filled_qty"]) or 0.0 for s in slices)
-    later = sum(_f(s["qty"]) or 0.0 for s in slices
-                if s["slice_idx"] > tidx and s["status"] == "scheduled")
-    outstanding = sum(max(0.0, (_f(s["qty"]) or 0.0) - (_f(s["filled_qty"]) or 0.0))
-                      for s in slices if s["slice_idx"] < tidx and s["status"] in SLICE_OPEN)
-    cap = total - filled_total - later - outstanding
-    new_qty = min((_f(target["qty"]) or 0.0) + extra, cap)
-    new_qty = algos.round_qty(max(new_qty, 0.0), rules.min_trade_increment)
-    final = tidx == last_idx
-    min_size = rules.min_order_size
-    if new_qty <= 0 or (min_size and new_qty < min_size):
-        nxt = next((s for s in slices if s["slice_idx"] > tidx and s["status"] == "scheduled"), None)
-        if nxt is not None and new_qty > 0:
-            conn.execute("UPDATE algo_slices SET qty=qty+?, updated_at=? WHERE algo_id=? AND slice_idx=?",
-                         (new_qty, runtime.now_iso(), algo_id, nxt["slice_idx"]))
-            _set_slice(conn, algo_id, tidx, qty=new_qty, status="rolled")
-        else:
-            _set_slice(conn, algo_id, tidx, qty=new_qty, status="cancelled")
-        conn.commit()
-        log.info("algo %s slice %d qty %s too small/none; %s", algo_id, tidx, new_qty,
-                 "rolled forward" if nxt is not None and new_qty > 0 else "skipped")
-        return
-    _set_slice(conn, algo_id, tidx, qty=new_qty)
-    conn.commit()
+    def verdict():
+        if done:
+            return "completed"
+        return "partial" if filled > 0 else "failed"
 
-    try:
-        params = json.loads(algo["params_json"] or "{}") or {}
-    except ValueError:
-        params = {}
-    strat = algos.get_strategy(algo["strategy"], params)
-    try:
-        quote = trader.latest_quote(algo["symbol"], r=r)
-        px = strat.child_price(algo["side"], quote, _f(algo["limit_cap"]), final, rules)
-    except Exception as e:
-        _warn_throttled(f"quote:{algo_id}", "algo %s slice %d: no price yet (%s); will retry",
-                        algo_id, tidx, e, every=10.0)
-        return
-    if px is None or px <= 0:
-        _warn_throttled(f"quote:{algo_id}", "algo %s slice %d: unusable price %r", algo_id, tidx, px,
-                        every=10.0)
-        return
-    _set_slice(conn, algo_id, tidx, limit_price=px)
-    conn.commit()
-    payload = {"cmd_id": runtime.new_id(), "kind": "submit", "account": account,
-               "client_order_id": target["client_order_id"] or coid_for(algo_id, tidx),
-               "symbol": algo["symbol"], "side": algo["side"], "type": "limit", "qty": new_qty,
-               "limit_price": px, "tif": "ioc" if final else "gtc", "source": "ems",
-               "algo_id": algo_id, "slice_idx": tidx}
-    try:
-        rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload, timeout=10.0)
-    except Exception as e:
-        rep = {"ok": False, "status": "timeout", "error": f"{type(e).__name__}: {e}"}
-    status = rep.get("status")
-    if rep.get("ok") and status in ("acked", "already_submitted"):
-        order = rep.get("order") if isinstance(rep.get("order"), dict) else {}
-        st = _map_slice_status(order.get("status"), "submitted")
-        if st == "submitted" and rep.get("order_id"):
-            st = "working"
-        _set_slice(conn, algo_id, tidx, status=st, order_id=rep.get("order_id"),
-                   filled_qty=_f(order.get("filled_qty")) or 0.0)
-        conn.commit()
-        log.info("algo %s slice %d submitted qty=%s px=%s tif=%s -> %s order=%s", algo_id, tidx,
-                 new_qty, px, payload["tif"], status, rep.get("order_id"))
-    elif status in ("rejected", "error", "already_submitted", "not_found"):
-        _set_slice(conn, algo_id, tidx, status="failed")
-        conn.commit()
-        _fail_algo(conn, r, algo_id, f"slice {tidx} {status}: {rep.get('error')}")
-    else:
-        _set_slice(conn, algo_id, tidx, status="submitted")
-        _set_algo(conn, algo_id, error=f"slice {tidx} submit {status}: {rep.get('error')}"[:500])
-        conn.commit()
-        log.warning("algo %s slice %d submit status %s (%s); will resolve later", algo_id, tidx,
-                    status, rep.get("error"))
-
-
-def _maybe_finalize(conn, r, algo_id, now) -> None:
-    algo = get_algo(conn, algo_id)
-    if algo is None or algo["status"] not in ALGO_ACTIVE:
-        return
-    slices = get_slices(conn, algo_id)
-    total = _f(algo["total_qty"]) or 0.0
-    filled = sum(_f(s["filled_qty"]) or 0.0 for s in slices)
-    end_ts = _parse_ts(algo["end_ts"]) or now
-    done = filled >= total * (1 - 1e-9)
-    if done:
-        conn.execute("UPDATE algo_slices SET status='cancelled', updated_at=? "
-                     "WHERE algo_id=? AND status='scheduled'", (runtime.now_iso(), algo_id))
-        slices = get_slices(conn, algo_id)
-    non_term = [s for s in slices if s["status"] not in SLICE_TERMINAL]
-    if non_term:
-        last = slices[-1]
-        others_term = all(s["status"] in SLICE_TERMINAL for s in slices[:-1])
-        if not (others_term and last["status"] in SLICE_OPEN and now > end_ts + 5):
-            if not done:
-                return
-    else:
-        # wait briefly for rolled/cancelled children still active at the broker to settle
-        if any(_order_active(conn, s["order_id"]) for s in slices) and now <= end_ts + 5 and not done:
-            return
-    if done:
+    all_term = all(s.get("status") in SLICE_TERMINAL for s in slices)
+    final = slices[-1] if slices else None
+    status = None
+    if all_term:
+        status = verdict()
+    elif done:
+        _cancel_open_slices(conn, r, algo, slices, mark="cancelled")
         status = "completed"
-    elif filled > 0:
-        status = "partial"
-    else:
-        status = "failed"
-    _set_algo(conn, algo_id, status=status, filled_qty=filled,
-              error=algo["error"] if status != "failed" else (algo["error"] or "no fills"))
-    conn.commit()
-    log.info("algo %s finished %s filled=%s/%s avg_px=%s", algo_id, status, filled, total,
-             algo["avg_px"])
+    elif (final is not None and final.get("status") in SLICE_OPEN
+          and now > _ts(algo.get("end_ts")) + FINAL_GRACE_S
+          and all(s.get("status") in SLICE_TERMINAL for s in slices[:-1])):
+        status = verdict()
+    if status:
+        err = None if status != "failed" else (algo.get("error") or "no fills")
+        _upd_algo(conn, algo_id, status=status, error=err)
+        log.info("algo %s finished: %s filled %.10g/%.10g avg_px=%s", algo_id, status, filled,
+                 total, algo.get("avg_px"))
 
 
-def _process_algo(conn, r, algo_id, now, allow_submit) -> None:
+def _tick_algo(conn, r, algo_id, now, allow_submit) -> None:
     refresh_from_oms(conn, algo_id)
-    algo = get_algo(conn, algo_id)
-    if algo is None or algo["status"] not in ALGO_ACTIVE:
+    algo = _get_algo(conn, algo_id)
+    if algo is None or algo.get("status") not in ALGO_ACTIVE:
         return
-    slices = get_slices(conn, algo_id)
+    slices = _get_slices(conn, algo_id)
     if not slices:
-        _fail_algo(conn, r, algo_id, "algo has no slices", allow_cancel=False)
+        _upd_algo(conn, algo_id, status="failed", error="no slices")
         return
-    first_ts = min(_parse_ts(s["scheduled_ts"]) or 0.0 for s in slices)
-    if algo["status"] == "pending" and now >= first_ts:
-        _set_algo(conn, algo_id, status="running")
-        conn.commit()
-        algo["status"] = "running"
-        log.info("algo %s running", algo_id)
-    if not _resolve_unknown(conn, r, algo, slices, now):
-        return
-    if algo["status"] == "running" and allow_submit and r is not None:
-        _submit_due(conn, r, algo, now)
-        algo = get_algo(conn, algo_id)
-        if algo is None or algo["status"] not in ALGO_ACTIVE:
+    last_idx = int(slices[-1]["slice_idx"])
+    if algo["status"] == "pending":
+        if now >= _ts(slices[0]["scheduled_ts"]):
+            _upd_algo(conn, algo_id, status="running")
+            algo["status"] = "running"
+            log.info("algo %s running", algo_id)
+        else:
             return
-        refresh_from_oms(conn, algo_id)
-    _maybe_finalize(conn, r, algo_id, now)
+    _resolve_unknown(conn, r, algo, slices, now)
+    slices = _get_slices(conn, algo_id)
+    if allow_submit:
+        due = [s for s in slices
+               if s.get("status") == "scheduled" and _ts(s.get("scheduled_ts")) <= now]
+        if due:
+            if _submit_due(conn, r, algo, slices, due, now, last_idx):
+                return
+            refresh_from_oms(conn, algo_id)
+    _finalise(conn, r, algo_id, now, last_idx)
 
 
 def tick(conn, r, now_ts: float | None = None, allow_submit: bool = True) -> int:
     now = float(now_ts) if now_ts is not None else runtime.utc_ts()
-    try:
-        ids = [row["algo_id"] for row in conn.execute(
-            "SELECT algo_id FROM algo_orders WHERE status IN ('pending','running') "
-            "ORDER BY created_at").fetchall()]
-    except sqlite3.OperationalError as e:
-        log.warning("tick: algo tables unavailable: %s", e)
-        return 0
-    n = 0
-    for algo_id in ids:
-        n += 1
+    active = _rows(conn, "SELECT algo_id FROM algo_orders WHERE status IN ('pending','running')"
+                         " ORDER BY created_at")
+    touched = 0
+    for a in active:
+        algo_id = a["algo_id"]
         try:
-            _process_algo(conn, r, algo_id, now, allow_submit)
+            _tick_algo(conn, r, algo_id, now, allow_submit)
             conn.commit()
         except Exception as e:
             log.exception("algo %s tick failed", algo_id)
@@ -648,34 +877,39 @@ def tick(conn, r, now_ts: float | None = None, allow_submit: bool = True) -> int
             except Exception:
                 pass
             try:
-                _fail_algo(conn, r, algo_id, f"{type(e).__name__}: {e}", allow_cancel=r is not None)
+                _upd_algo(conn, algo_id, status="failed",
+                          error=f"{type(e).__name__}: {e}"[:1000])
+                conn.commit()
             except Exception:
-                log.exception("could not mark algo %s failed", algo_id)
+                log.exception("algo %s: could not mark failed", algo_id)
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-    return n
+        touched += 1
+    return touched
 
 
 # --------------------------------------------------------------------------- worker
 def _parse_fields(fields) -> dict:
     raw = (fields or {}).get("json")
     if raw is None:
-        raise ValueError("missing json field")
+        raise ValueError("entry has no 'json' field")
     d = json.loads(raw)
     if not isinstance(d, dict):
-        raise ValueError("json payload is not an object")
+        raise ValueError("payload is not a JSON object")
     return d
 
 
 def process_requests(conn, r, reader) -> int:
     entries = reader.read()
     for eid, fields in entries:
-        rid = None
+        cmd_id = None
+        kind = None
         try:
             payload = _parse_fields(fields)
-            rid = payload.get("req_id") or payload.get("cmd_id")
+            cmd_id = payload.get("cmd_id") or payload.get("req_id")
+            kind = payload.get("kind")
             handle_request(conn, r, payload)
             conn.commit()
             reader.ack(eid)
@@ -684,14 +918,17 @@ def process_requests(conn, r, reader) -> int:
                 conn.rollback()
             except Exception:
                 pass
-            log.exception("request %s (%s) failed; dead-lettering", eid, rid)
-            if rid:
-                _send_reply(r, rid, _reply(str(rid), ok=False, status="error",
-                                           error=f"ems error: {e!r}"[:500]))
-            try:
-                reader.dead_letter(eid, fields, repr(e))
-            except Exception:
-                log.exception("dead_letter failed for %s", eid)
+            log.exception("request entry %s failed; dead-lettering", eid)
+            if cmd_id and r is not None:
+                try:
+                    reply = {"ok": False, "status": "error", "cmd_id": cmd_id,
+                             "error": f"{type(e).__name__}: {e}"}
+                    if kind in ("create", "cancel"):
+                        reply.update({"algo_id": None, "algo": None})
+                    runtime.send_reply(r, str(cmd_id), reply)
+                except Exception:
+                    pass
+            reader.dead_letter(eid, fields, f"{type(e).__name__}: {e}")
     return len(entries)
 
 
@@ -701,18 +938,28 @@ def body() -> None:
     try:
         setup_db(conn)
         consumer = os.environ.get("EMS_CONSUMER", "ems-1")
-        reader = runtime.GroupReader(r, runtime.STREAM_EMS_REQUESTS, GROUP, consumer, block_ms=500)
+        reader = runtime.GroupReader(r, runtime.STREAM_EMS_REQUESTS, GROUP, consumer,
+                                     block_ms=500)
         log.info("ems started consumer=%s", consumer)
+        last_warn = 0.0
+        next_tick = 0.0
         while True:
-            t0 = time.monotonic()
             process_requests(conn, r, reader)
-            oms_up = runtime.worker_alive(r, "oms") is not None
-            if not oms_up:
-                _warn_throttled("oms_down", "OMS heartbeat missing; skipping child submits this tick")
-            tick(conn, r, allow_submit=oms_up)
-            elapsed = time.monotonic() - t0
-            if elapsed < 1.0:
-                time.sleep(1.0 - elapsed)
+            mono = time.monotonic()
+            if mono >= next_tick:
+                next_tick = mono + 1.0
+                oms_up = runtime.worker_alive(r, "oms") is not None
+                if not oms_up and mono - last_warn >= 30.0:
+                    last_warn = mono
+                    log.warning("OMS heartbeat missing; not starting new algo children")
+                try:
+                    tick(conn, r, allow_submit=oms_up)
+                except sqlite3.Error as e:
+                    log.warning("tick failed: %s", e)
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
     finally:
         try:
             conn.close()

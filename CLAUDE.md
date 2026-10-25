@@ -42,15 +42,23 @@ Only one TradingStream per Alpaca account: do not run `../TradingWithAlpaca` wor
 
 ## Architecture (what the generated code must satisfy)
 
-- **OMS** (`oms.py`) is the only caller of Alpaca order endpoints and owns `orders, fills,
-  trade_events, commands`. Everyone submits via the Redis Stream `alpaca:oms:commands` and waits
-  on `alpaca:reply:<cmd_id>` (`runtime.send_command`). Idempotent on `client_order_id`.
-  Consumer-group reads drain the pending list first and XAUTOCLAIM stale entries; failures go to
-  `alpaca:trade_updates:dlq`. REST reconciliation at start and every 30 s.
+- **OMS → EMS → exchange.** OMS (`oms.py`) is the front door and owns the order *lifecycle*:
+  every intent (`submit`, `cancel`, `algo_create`, `algo_cancel`) arrives on the Redis Stream
+  `alpaca:oms:commands` and is answered on `alpaca:reply:<cmd_id>` (`runtime.send_command`). OMS
+  validates, audits in `commands`, enforces idempotency on `client_order_id`, then forwards
+  execution to EMS on `alpaca:ems:requests` and relays the reply. OMS makes no Alpaca order calls.
+  It owns `orders, fills, trade_events, commands`, consumes `alpaca:trade_updates` (exchange events
+  and EMS execution reports), and reconciles with REST at start and every 30 s. Consumer-group reads
+  drain the pending list first and XAUTOCLAIM stale entries; failures go to `alpaca:trade_updates:dlq`.
+- **EMS** (`ems.py`) is the *execution* side and the only caller of Alpaca order endpoints
+  (`execute_submit` / `execute_cancel` via trader.py). It serves OMS's `submit` / `cancel_order`
+  requests and runs the algos; TWAP children are submitted by EMS itself. After every submit or
+  cancel it publishes an execution report (`ems_submitted` / `ems_cancel_requested`) onto
+  `alpaca:trade_updates`, which is how the `orders` row gets its `source/algo_id/slice_idx`.
 - **oms_ems** (`oms_ems.py`) hosts `oms.body` and `ems.body` as two supervised daemon threads in one
   process (each via `runtime.run_forever`, so both `alpaca:heartbeat:oms` and `:ems` are still written).
   `oms.py` / `ems.py` remain runnable standalone; `run_all.sh` launches `oms_ems` instead of both.
-- **EMS** (`ems.py`) owns `algo_orders, algo_slices`; schedules are persisted so a restart resumes.
+- EMS owns `algo_orders, algo_slices`; schedules are persisted so a restart resumes.
   TWAP children are limit-at-touch GTC, rolled forward at the next slice, final slice IOC crossing
   by `cross_bps`, always clamped to `limit_cap`. VWAP/IS are registered stubs (GUI shows them disabled).
 - **runtime.py** is the shared resilience layer: `run_forever` supervisor + heartbeat

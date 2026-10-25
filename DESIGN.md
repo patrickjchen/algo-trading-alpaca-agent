@@ -26,11 +26,13 @@ Flask `url_map` rules (webgui) / required substrings (HTML) / `pytest` (test sta
 
 ```
  Alpaca crypto WS ──► subscriber.py ──► Redis: alpaca:latest:*, alpaca:ob:{bids,asks}:*, alpaca:recent:*, alpaca:symbols
- Alpaca trading WS ─► trade_stream.py ► Redis Stream alpaca:trade_updates ──► oms.py ──► SQLite orders/fills/trade_events
-                                                                                 ▲   └──► alpaca:trade_updates:dlq
- webgui.py / cli.py ── XADD alpaca:oms:commands ─────────────────────────────────┘   (submit/cancel; reply alpaca:reply:<id>)
- webgui.py / cli.py ── XADD alpaca:ems:requests ──► ems.py ──► SQLite algo_orders/algo_slices
-                                                      └── child submits/cancels ──► alpaca:oms:commands
+ Alpaca trading WS ─► trade_stream.py ► Redis Stream alpaca:trade_updates ──► oms.py ──► SQLite orders/fills/trade_events/commands
+                                              ▲                                  ▲   └──► alpaca:trade_updates:dlq
+ ems.py execution reports (ems_submitted, ems_cancel_requested) ┘                  │
+ webgui.py / cli.py ── XADD alpaca:oms:commands (submit/cancel/algo_create/algo_cancel) ┘   reply alpaca:reply:<cmd_id>
+ oms.py ── XADD alpaca:ems:requests (submit/cancel_order/create/cancel) ──► ems.py ──► Alpaca REST (the ONLY order writer)
+                                                                              └──► SQLite algo_orders/algo_slices (TWAP engine;
+                                                                                   children submitted by ems.py itself)
  every worker ──► alpaca:heartbeat:<name> (EX 15) ──► webgui /api/health, cli health, live tests
  oms_ems.py ──► runs oms.body + ems.body as two supervised threads in one process (both heartbeats kept)
 ```
