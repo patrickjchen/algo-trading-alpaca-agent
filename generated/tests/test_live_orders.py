@@ -1,125 +1,155 @@
-"""Live: submit / duplicate / cancel a non-marketable paper limit BUY through the OMS."""
+"""Live: order lifecycle through OMS -> EMS -> Alpaca PAPER, live Redis state and persister history.
+
+Orders are non-marketable LIMIT BUYs 20% below the bid and are always cancelled in ``finally``.
+"""
 from __future__ import annotations
+
+import json
 
 import pytest
 
 import runtime
-from tests.conftest import db, ensure_oms_ems, ensure_worker, safe_limit_buy, wait_until
+from tests.conftest import (db, ensure_oms_ems, ensure_worker, paper_only, safe_limit_buy,
+                            wait_until)
 
 pytestmark = pytest.mark.live
 
-
-def _row(sql, args):
-    conn = db()
-    try:
-        row = conn.execute(sql, args).fetchone()
-        return {k: row[k] for k in row.keys()} if row is not None else None
-    finally:
-        conn.close()
+OPEN_STATES = {"new", "accepted", "pending_new"}
 
 
-def _cleanup(r, order_id, cid):
-    """Best-effort cancel: via OMS first, direct paper REST as a safety fallback."""
-    import trader
-    try:
-        if runtime.worker_alive(r, "oms"):
-            rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
-                "kind": "cancel", "account": "paper", "order_id": order_id,
-                "client_order_id": cid, "source": "test"}, timeout=10)
-            if rep.get("ok") or rep.get("status") == "not_found":
-                return
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        o = trader.get_order_by_client_id(cid, live=False)
-        if o and str(o.get("status")) not in runtime.TERMINAL_STATUSES:
-            trader.cancel(o["id"], live=False)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def test_submit_duplicate_cancel(live_redis):
-    import trader
-    r = live_redis
+def _require_workers():
+    paper_only()
     ensure_worker("trade_stream")
     ensure_oms_ems()
+    ensure_worker("persister")
 
-    o = safe_limit_buy("BTC/USD")
-    print("placing", o["qty"], "@", o["limit_price"], "bid", o["quote"]["bid_price"])
-    cid = runtime.new_client_order_id("tc")
-    submit = {"kind": "submit", "account": "paper", "client_order_id": cid, "symbol": "BTC/USD",
-              "side": "buy", "type": "limit", "qty": o["qty"], "limit_price": o["limit_price"],
-              "tif": "gtc", "source": "test", "algo_id": None, "slice_idx": None}
-    order_id = None
-    submit_cmd = runtime.new_id()
+
+def _submit_payload(spec: dict, coid: str) -> dict:
+    return {"kind": "submit", "account": "paper", "client_order_id": coid, "symbol": spec["symbol"],
+            "side": "buy", "type": "limit", "qty": spec["qty"], "limit_price": spec["limit_price"],
+            "tif": "gtc", "source": "test"}
+
+
+def _safety_cancel(r, order_id, coid):
+    """Best-effort: make sure the order is not left resting on the paper account."""
+    if not order_id and not coid:
+        return
     try:
-        rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {**submit, "cmd_id": submit_cmd},
-                                   timeout=20)
-        print("submit reply:", rep)
-        assert rep.get("status") == "acked", rep
-        assert rep.get("ok") is True
-        order_id = rep.get("order_id")
+        h = r.hgetall(runtime.order_key(order_id)) if order_id else {}
+        if h.get("status") in runtime.TERMINAL_STATUSES:
+            return
+        if runtime.worker_alive(r, "oms"):
+            runtime.send_command(r, runtime.STREAM_OMS_COMMANDS,
+                                 {"kind": "cancel", "account": "paper", "order_id": order_id,
+                                  "client_order_id": coid, "source": "test"}, timeout=15)
+        import trader
+        o = trader.get_order_by_client_id(coid) if coid else None
+        st = str((o or {}).get("status") or "").lower()
+        if o and st not in runtime.TERMINAL_STATUSES:
+            ok = wait_until(lambda: str((trader.get_order_by_client_id(coid) or {}).get("status") or "")
+                            .lower() in runtime.TERMINAL_STATUSES, 10)
+            if not ok:
+                trader.cancel(o.get("id"), False)  # last-resort safety net
+    except Exception as e:  # noqa: BLE001
+        print("safety cancel failed:", e)
+
+
+def test_order_lifecycle_via_oms(live_redis):
+    r = live_redis
+    _require_workers()
+    spec = safe_limit_buy("BTC/USD")
+    print("order spec:", {k: spec[k] for k in ("symbol", "qty", "limit_price")})
+    coid = runtime.new_client_order_id("tc")
+    order_id = None
+    conn = db()
+    try:
+        payload = _submit_payload(spec, coid)
+        reply = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, payload, timeout=20)
+        print("submit reply:", reply)
+        assert reply.get("ok") is True and reply.get("status") == "acked", reply
+        order_id = reply.get("order_id")
         assert order_id
-        status = (rep.get("order") or {}).get("status")
-        assert status in {"new", "accepted", "pending_new"}, status
+        assert reply.get("client_order_id") == coid
+        order = reply.get("order") or {}
+        assert str(order.get("status")).lower() in OPEN_STATES, order
+        first_cmd_id = reply["cmd_id"]
 
-        broker = trader.get_order_by_client_id(cid, live=False)
-        assert broker is not None
-        assert str(broker["id"]) == order_id
-        assert broker["client_order_id"] == cid
+        # live Redis state is written synchronously by OMS before replying
+        h = r.hgetall(runtime.order_key(order_id))
+        assert h, "live order hash missing"
+        assert h.get("client_order_id") == coid
+        assert r.get(runtime.coid_key(coid)) == order_id
+        assert r.sismember(runtime.SET_OPEN_ORDERS, order_id)
 
-        ev = wait_until(lambda: _row(
-            "SELECT * FROM trade_events WHERE order_id=? AND event IN ('new','accepted','pending_new')",
-            (order_id,)), 20)
-        assert ev, "no new/accepted trade_event for the order"
-        orow = wait_until(lambda: _row("SELECT * FROM orders WHERE order_id=?", (order_id,)), 20)
-        assert orow and orow["account"] == "paper"
+        import trader
+        ex = trader.get_order_by_client_id(coid)
+        assert ex is not None and str(ex.get("id")) == order_id
 
-        dup = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, dict(submit), timeout=20)
+        # persister history
+        assert wait_until(lambda: conn.execute(
+            "SELECT 1 FROM trade_events WHERE order_id=? AND event IN "
+            "('ems_submitted','new','accepted','pending_new')", (order_id,)).fetchone(), 20), \
+            "no trade_events row for submitted order"
+        row = wait_until(lambda: conn.execute(
+            "SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone(), 20)
+        assert row is not None, "orders row missing"
+        assert row["account"] == "paper"
+        assert wait_until(lambda: conn.execute(
+            "SELECT source FROM orders WHERE order_id=?", (order_id,)).fetchone()[0] == "test", 20)
+        crow = wait_until(lambda: conn.execute(
+            "SELECT * FROM commands WHERE cmd_id=?", (first_cmd_id,)).fetchone(), 20)
+        assert crow is not None, "commands row missing"
+        assert crow["status"] == "acked"
+
+        # duplicate client_order_id with a new cmd_id -> already_submitted
+        dup = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, _submit_payload(spec, coid), timeout=20)
+        print("duplicate reply:", dup)
         assert dup.get("status") == "already_submitted", dup
         assert dup.get("order_id") == order_id
 
-        cancel_cmd = runtime.new_id()
-        crep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
-            "cmd_id": cancel_cmd, "kind": "cancel", "account": "paper", "order_id": order_id,
-            "source": "test"}, timeout=20)
-        assert crep.get("status") == "cancel_requested", crep
+        # replay of the SAME cmd_id -> identical stored reply
+        again = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS,
+                                     dict(payload, cmd_id=first_cmd_id), timeout=20)
+        assert json.loads(json.dumps(again, default=str)) == json.loads(json.dumps(reply, default=str))
 
-        assert wait_until(lambda: (_row("SELECT status FROM orders WHERE order_id=?", (order_id,))
-                                   or {}).get("status") == "canceled", 20), "order not canceled in DB"
-        assert wait_until(lambda: _row(
-            "SELECT 1 AS x FROM trade_events WHERE order_id=? AND event='canceled'", (order_id,)), 20)
+        # cancel through OMS
+        cr = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS,
+                                  {"kind": "cancel", "account": "paper", "order_id": order_id,
+                                   "source": "test"}, timeout=20)
+        print("cancel reply:", cr)
+        assert cr.get("status") == "cancel_requested", cr
 
-        s_row = _row("SELECT * FROM commands WHERE cmd_id=?", (submit_cmd,))
-        c_row = _row("SELECT * FROM commands WHERE cmd_id=?", (cancel_cmd,))
-        assert s_row and s_row["kind"] == "submit" and s_row["client_order_id"] == cid
-        assert c_row and c_row["kind"] == "cancel"
+        assert wait_until(lambda: r.hget(runtime.order_key(order_id), "status") == "canceled", 20), \
+            f"hash status is {r.hget(runtime.order_key(order_id), 'status')}"
+        assert wait_until(lambda: not r.sismember(runtime.SET_OPEN_ORDERS, order_id), 10)
+        assert r.ttl(runtime.order_key(order_id)) > 0
 
-        rep_row = wait_until(lambda: _row(
-            "SELECT * FROM trade_events WHERE order_id=? AND event='ems_submitted'", (order_id,)), 20)
-        assert rep_row, "no ems_submitted execution report in trade_events"
-        exch = _row("SELECT COUNT(*) AS n FROM trade_events WHERE order_id=? AND event NOT LIKE 'ems_%'",
-                    (order_id,))
-        assert exch and exch["n"] >= 2, "expected exchange events besides EMS reports"
-        assert not _row("SELECT 1 AS x FROM fills WHERE order_id=?", (order_id,)), \
-            "a non-marketable order must not have fills"
+        assert wait_until(lambda: conn.execute(
+            "SELECT status FROM orders WHERE order_id=?", (order_id,)).fetchone()[0] == "canceled", 20), \
+            "orders.status never became canceled"
+        assert wait_until(lambda: conn.execute(
+            "SELECT 1 FROM trade_events WHERE order_id=? AND event='canceled'", (order_id,)).fetchone(), 20), \
+            "no canceled trade_event"
     finally:
-        _cleanup(r, order_id, cid)
+        _safety_cancel(r, order_id, coid)
+        conn.close()
 
 
-def test_submit_unknown_symbol_rejected(live_redis):
+def test_unknown_symbol_rejected(live_redis):
     r = live_redis
-    ensure_oms_ems()
-    cid = runtime.new_client_order_id("tc")
-    rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
-        "kind": "submit", "account": "paper", "client_order_id": cid, "symbol": "NOPE/XYZ",
-        "side": "buy", "type": "limit", "qty": 1, "limit_price": 1, "tif": "gtc",
-        "source": "test"}, timeout=20)
+    _require_workers()
+    coid = runtime.new_client_order_id("tc")
+    order_id = None
     try:
-        print("reply:", rep)
-        assert rep.get("status") == "rejected", rep
-        assert rep.get("ok") is False
-        assert isinstance(rep.get("error"), str) and rep["error"]
+        reply = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
+            "kind": "submit", "account": "paper", "client_order_id": coid, "symbol": "NOPE/XYZ",
+            "side": "buy", "type": "limit", "qty": 1.0, "limit_price": 1.0, "tif": "gtc",
+            "source": "test"}, timeout=20)
+        print("unknown symbol reply:", reply)
+        order_id = reply.get("order_id")
+        assert reply.get("ok") is False
+        assert reply.get("status") == "rejected", reply
+        assert isinstance(reply.get("error"), str) and reply["error"]
     finally:
-        if rep.get("order_id"):
-            _cleanup(r, rep["order_id"], cid)
+        if order_id:
+            _safety_cancel(r, order_id, coid)

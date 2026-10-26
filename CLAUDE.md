@@ -36,31 +36,35 @@ Costs: Opus 5.5, ≤$6 per agent call by default (`--budget`), ~12 stages per fu
 Logs: `.codegen_logs/run-*.jsonl`; last-good backups `.codegen_backup/`; failed attempts `.codegen_failed/`.
 
 Runtime (paper by default): `cp run.bash.example run.bash`, fill keys, `source run.bash`,
-start Redis, `scripts/run_all.sh` (4 processes: subscriber, trade_stream, oms_ems, webgui;
+start Redis, `scripts/run_all.sh` (6 processes: subscriber, trade_stream, oms_ems, algo_engine, persister, webgui;
 UI on http://127.0.0.1:5000). `cd generated && python cli.py health|symbols|buy|twap ...`.
 Only one TradingStream per Alpaca account: do not run `../TradingWithAlpaca` workers concurrently.
 
 ## Architecture (what the generated code must satisfy)
 
+- **Hot path = Redis only; SQLite is written by one worker.** OMS, EMS and the algo engine keep
+  their operational state in Redis hashes/sets and never open SQLite. `persister.py` is the only SQLite
+  writer: consumer groups on `alpaca:trade_updates`, `alpaca:oms:events` and `alpaca:algo:events`
+  feed `orders, fills, trade_events, commands, algo_orders, algo_slices` with batched, idempotent
+  upserts. It owns the schema (`persister.SCHEMA/setup_db`). webgui and cli read SQLite read-only
+  for history and Redis for live state.
 - **OMS → EMS → exchange.** OMS (`oms.py`) is the front door and owns the order *lifecycle*:
-  every intent (`submit`, `cancel`, `algo_create`, `algo_cancel`) arrives on the Redis Stream
-  `alpaca:oms:commands` and is answered on `alpaca:reply:<cmd_id>` (`runtime.send_command`). OMS
-  validates, audits in `commands`, enforces idempotency on `client_order_id`, then forwards
-  execution to EMS on `alpaca:ems:requests` and relays the reply. OMS makes no Alpaca order calls.
-  It owns `orders, fills, trade_events, commands`, consumes `alpaca:trade_updates` (exchange events
-  and EMS execution reports), and reconciles with REST at start and every 30 s. Consumer-group reads
-  drain the pending list first and XAUTOCLAIM stale entries; failures go to `alpaca:trade_updates:dlq`.
-- **EMS** (`ems.py`) is the *execution* side and the only caller of Alpaca order endpoints
-  (`execute_submit` / `execute_cancel` via trader.py). It serves OMS's `submit` / `cancel_order`
-  requests and runs the algos; TWAP children are submitted by EMS itself. After every submit or
-  cancel it publishes an execution report (`ems_submitted` / `ems_cancel_requested`) onto
-  `alpaca:trade_updates`, which is how the `orders` row gets its `source/algo_id/slice_idx`.
-- **oms_ems** (`oms_ems.py`) hosts `oms.body` and `ems.body` as two supervised daemon threads in one
-  process (each via `runtime.run_forever`, so both `alpaca:heartbeat:oms` and `:ems` are still written).
-  `oms.py` / `ems.py` remain runnable standalone; `run_all.sh` launches `oms_ems` instead of both.
-- EMS owns `algo_orders, algo_slices`; schedules are persisted so a restart resumes.
-  TWAP children are limit-at-touch GTC, rolled forward at the next slice, final slice IOC crossing
-  by `cross_bps`, always clamped to `limit_cap`. VWAP/IS are registered stubs (GUI shows them disabled).
+  every intent (`submit`, `cancel`, `algo_create`, `algo_cancel`) arrives on `alpaca:oms:commands` and
+  is answered on `alpaca:reply:<cmd_id>` (`runtime.send_command`). OMS validates, replays by `cmd_id`
+  (`alpaca:cmd:<id>`), dedupes by `client_order_id` (`alpaca:coid:<id>`), forwards execution to EMS on
+  `alpaca:ems:requests` or algos to the algo engine on `alpaca:algo:requests`, relays the reply, and
+  maintains the live order hashes `alpaca:order:<id>` + `alpaca:orders:open` from EMS replies,
+  `alpaca:trade_updates` and REST reconciliation (every 30 s). It emits order/command snapshots to
+  `alpaca:oms:events` for the persister. OMS makes no Alpaca order calls.
+- **EMS** (`ems.py`) is the exchange gateway and the only caller of Alpaca order endpoints
+  (`execute_submit` / `execute_cancel` via trader.py). After every submit or cancel it publishes an
+  execution report (`ems_submitted` / `ems_cancel_requested`) onto `alpaca:trade_updates`. No algos.
+- **Algo engine** (`algo_engine.py`) is the strategy service: it takes `create`/`cancel` from OMS,
+  builds the schedule with `algos.py` (TWAP real; VWAP/IS stubs), keeps `alpaca:algo:<id>`,
+  `alpaca:algo:<id>:slices`, `alpaca:algos:active` in Redis, submits every child THROUGH OMS
+  (`source: "algo"`), tracks children via the OMS order hashes, emits snapshots to `alpaca:algo:events`,
+  and reloads running algos from SQLite once at cold start. TWAP children are limit-at-touch GTC,
+  rolled forward at the next slice, final slice IOC crossing by `cross_bps`, clamped to `limit_cap`.
 - **runtime.py** is the shared resilience layer: `run_forever` supervisor + heartbeat
   (`alpaca:heartbeat:<worker>`, EX 15), `redis_call` with `SpillBuffer`, `GroupReader`,
   `sqlite_connect` (WAL). Stream handlers never raise (alpaca-py drops the event otherwise).

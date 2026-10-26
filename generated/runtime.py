@@ -41,6 +41,12 @@ STREAM_TRADE_UPDATES = "alpaca:trade_updates"
 STREAM_TRADE_UPDATES_DLQ = "alpaca:trade_updates:dlq"
 STREAM_OMS_COMMANDS = "alpaca:oms:commands"
 STREAM_EMS_REQUESTS = "alpaca:ems:requests"
+STREAM_ALGO_REQUESTS = "alpaca:algo:requests"
+STREAM_OMS_EVENTS = "alpaca:oms:events"
+STREAM_ALGO_EVENTS = "alpaca:algo:events"
+SET_OPEN_ORDERS = "alpaca:orders:open"
+SET_ACTIVE_ALGOS = "alpaca:algos:active"
+STATE_TTL_S = 86400
 TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
 ACTIVE_STATUSES = frozenset({"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding",
                              "pending_cancel", "pending_replace", "calculated", "held"})
@@ -371,3 +377,83 @@ def send_reply(r, cmd_id: str, reply: dict) -> None:
     pipe.rpush(key, json.dumps(reply, default=str))
     pipe.expire(key, 60)
     pipe.execute()
+
+
+def publish(r, stream: str, payload: dict, *, maxlen: int = 100000,
+            buffer: SpillBuffer | None = None) -> None:
+    redis_call(r.xadd, stream, {"json": json.dumps(payload, default=str)}, maxlen=maxlen,
+               approximate=True, buffer=buffer)
+
+
+def order_key(order_id) -> str: return f"alpaca:order:{order_id}"
+def coid_key(cid) -> str: return f"alpaca:coid:{cid}"
+def cmd_key(cmd_id) -> str: return f"alpaca:cmd:{cmd_id}"
+def algo_key(algo_id) -> str: return f"alpaca:algo:{algo_id}"
+def algo_slices_key(algo_id) -> str: return f"alpaca:algo:{algo_id}:slices"
+
+
+def _sval(v) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (dict, list, tuple)):
+        return json.dumps(v, default=str)
+    return str(v)
+
+
+def hset_state(r, key: str, mapping: dict, *, ttl: int | None = None) -> None:
+    clean = {k: _sval(v) for k, v in (mapping or {}).items() if v is not None}
+    pipe = r.pipeline()
+    if clean:
+        pipe.hset(key, mapping=clean)
+    if ttl is not None:
+        pipe.expire(key, int(ttl))
+    else:
+        pipe.persist(key)
+    pipe.execute()
+
+
+def _enum_str(v):
+    if v is None:
+        return None
+    v = getattr(v, "value", v)
+    s = str(v).strip()
+    if not s:
+        return None
+    if "." in s and s.split(".", 1)[0][:1].isupper():
+        s = s.rsplit(".", 1)[1]
+    return s.lower()
+
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ts(v):
+    if v is None or v == "":
+        return None
+    return v.isoformat() if isinstance(v, datetime) else str(v)
+
+
+def normalize_order(order: dict) -> dict:
+    o = order or {}
+    oid = o.get("id") or o.get("order_id")
+    cid = o.get("client_order_id")
+    sym = o.get("symbol")
+    return {
+        "order_id": str(oid) if oid not in (None, "") else None,
+        "client_order_id": str(cid) if cid not in (None, "") else None,
+        "symbol": str(sym) if sym not in (None, "") else None,
+        "side": _enum_str(o.get("side")),
+        "type": _enum_str(o.get("type") or o.get("order_type")),
+        "time_in_force": _enum_str(o.get("time_in_force")),
+        "qty": _num(o.get("qty")), "limit_price": _num(o.get("limit_price")),
+        "filled_qty": _num(o.get("filled_qty")), "filled_avg_price": _num(o.get("filled_avg_price")),
+        "status": _enum_str(o.get("status")),
+        "submitted_at": _ts(o.get("submitted_at")), "created_at": _ts(o.get("created_at")),
+        "updated_at": _ts(o.get("updated_at")),
+    }

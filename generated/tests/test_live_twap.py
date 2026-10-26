@@ -1,67 +1,83 @@
-"""Live: end-to-end TWAP through EMS -> OMS -> Alpaca paper (fills tiny qty). --run-twap only."""
+"""Live: TWAP end-to-end through OMS (algo_create) -> algo engine -> OMS -> EMS -> PAPER.
+
+Runs only with ``--run-twap`` (fills tiny paper quantities).
+"""
 from __future__ import annotations
+
+import json
 
 import pytest
 
 import runtime
-from tests.conftest import db, ensure_oms_ems, ensure_worker, round_up, wait_until
+from tests.conftest import (db, ensure_oms_ems, ensure_worker, paper_only, round_up, wait_until)
 
 pytestmark = pytest.mark.live
 
 DONE = {"completed", "partial"}
 
 
-def _q(sql, args=()):
-    conn = db()
-    try:
-        return [{k: row[k] for k in row.keys()} for row in conn.execute(sql, args).fetchall()]
-    finally:
-        conn.close()
-
-
 def test_twap_end_to_end(live_redis, request):
     if not request.config.getoption("--run-twap"):
-        pytest.skip("needs --run-twap (places and fills real paper orders)")
-    import trader
+        pytest.skip("needs --run-twap")
+    paper_only()
     r = live_redis
-    for w in ("subscriber", "trade_stream"):
-        ensure_worker(w)
+    ensure_worker("subscriber")
+    ensure_worker("trade_stream")
     ensure_oms_ems()
+    ensure_worker("persister")
+    ensure_worker("algo_engine")
 
+    import trader
     rules = trader.get_asset_rules("BTC/USD")
-    min_qty = round_up(max(rules["min_order_size"] or 0.0, rules["min_trade_increment"] or 0.0),
-                       rules["min_trade_increment"])
-    total = round_up(2 * min_qty, rules["min_trade_increment"])
+    quote = trader.latest_quote("BTC/USD")
+    px = float(quote["ask_price"])
+    min_qty = round_up(max(rules.get("min_order_size") or 0.0, 2.0 / px), rules.get("min_trade_increment"))
+    total = round_up(2 * min_qty, rules.get("min_trade_increment"))
+    print("TWAP total_qty:", total)
+
     algo_id = None
+    conn = db()
     try:
         rep = runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
-            "kind": "algo_create", "strategy": "twap", "account": "paper",
-            "symbol": "BTC/USD", "side": "buy", "total_qty": total, "duration_s": 30, "n_slices": 2,
-            "limit_cap": None, "params": {}, "source": "test"}, timeout=20)
-        print("create reply:", {k: rep.get(k) for k in ("ok", "status", "algo_id", "error")})
+            "kind": "algo_create", "strategy": "twap", "account": "paper", "symbol": "BTC/USD",
+            "side": "buy", "total_qty": total, "duration_s": 30, "n_slices": 2, "limit_cap": None,
+            "params": {}, "source": "test"}, timeout=20)
+        print("algo_create reply:", rep)
         assert rep.get("ok") is True, rep
-        algo_id = rep["algo_id"]
+        algo_id = rep.get("algo_id")
+        assert algo_id
 
-        def status():
-            rows = _q("SELECT status FROM algo_orders WHERE algo_id=?", (algo_id,))
-            return rows[0]["status"] if rows else None
+        status = wait_until(lambda: (lambda s: s if s in DONE else None)(
+            r.hget(runtime.algo_key(algo_id), "status")), 120, every=1.0)
+        h = r.hgetall(runtime.algo_key(algo_id))
+        print("algo:", h)
+        assert status in DONE, f"algo status {h.get('status')} error={h.get('error')}"
 
-        final = wait_until(lambda: status() if status() in DONE | {"failed", "cancelled"} else None,
-                           120, every=1.0)
-        assert final in DONE, f"algo ended {final!r}"
+        slices = [json.loads(v) for v in r.hgetall(runtime.algo_slices_key(algo_id)).values()]
+        assert slices
+        child_ids = []
+        for sl in slices:
+            print("slice:", sl)
+            assert str(sl.get("client_order_id") or "").startswith("algo-")
+            if sl.get("status") in ("filled", "cancelled", "submitted", "working") or sl.get("order_id"):
+                assert sl.get("order_id"), f"slice {sl.get('slice_idx')} has no order_id"
+                child_ids.append(sl["order_id"])
+        assert child_ids
 
-        children = _q("SELECT order_id, client_order_id FROM orders WHERE client_order_id LIKE ?",
-                      (f"algo-{algo_id[:12]}-%",))
-        assert children, "no child orders recorded"
-        for c in children:
-            assert c["client_order_id"].startswith("algo-")
-        ids = [c["order_id"] for c in children]
-        ph = ",".join("?" * len(ids))
-        fills = wait_until(lambda: _q(f"SELECT * FROM fills WHERE order_id IN ({ph})", ids), 30)
-        assert fills and len(fills) >= 1, "no fills for algo children"
+        row = wait_until(lambda: (lambda row: row if row and row["status"] == status else None)(
+            conn.execute("SELECT * FROM algo_orders WHERE algo_id=?", (algo_id,)).fetchone()), 20)
+        assert row is not None, "algo_orders row missing or status mismatch"
+        marks = ",".join("?" for _ in child_ids)
+        assert wait_until(lambda: conn.execute(
+            f"SELECT COUNT(*) FROM fills WHERE order_id IN ({marks})", child_ids).fetchone()[0] >= 1, 20), \
+            "no fills persisted for TWAP children"
     finally:
         if algo_id:
-            st = _q("SELECT status FROM algo_orders WHERE algo_id=?", (algo_id,))
-            if st and st[0]["status"] in ("pending", "running"):
-                runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
-                    "kind": "algo_cancel", "algo_id": algo_id, "source": "test"}, timeout=20)
+            st = r.hget(runtime.algo_key(algo_id), "status")
+            if st not in ("completed", "partial", "cancelled", "failed"):
+                try:
+                    print("cancel algo:", runtime.send_command(r, runtime.STREAM_OMS_COMMANDS, {
+                        "kind": "algo_cancel", "algo_id": algo_id, "source": "test"}, timeout=20))
+                except Exception as e:  # noqa: BLE001
+                    print("algo cancel failed:", e)
+        conn.close()

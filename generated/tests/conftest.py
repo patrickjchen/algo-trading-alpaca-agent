@@ -91,11 +91,9 @@ def no_creds(monkeypatch):
 
 @pytest.fixture
 def db_conn(tmp_path):
-    import ems
-    import oms
+    import persister  # persister owns the schema
     conn = runtime.sqlite_connect(str(tmp_path / "t.db"))
-    oms.setup_db(conn)
-    ems.setup_db(conn)
+    persister.setup_db(conn)
     yield conn
     conn.close()
 

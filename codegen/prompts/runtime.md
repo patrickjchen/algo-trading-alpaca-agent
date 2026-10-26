@@ -1,5 +1,5 @@
 You are generating: runtime.py — the shared resilience library every worker imports.
-Keep it ≤ 350 lines, stdlib + `redis` only (no alpaca import here). Pure
+Keep it ≤ 450 lines, stdlib + `redis` only (no alpaca import here). Pure
 functions and small classes; nothing executes at import except constant
 definitions. All names below are REQUIRED (the verifier checks them).
 
@@ -8,6 +8,10 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")           # 
 DB_PATH   = os.environ.get("ALPACA_DB_PATH") or str(Path(__file__).resolve().parent.parent / "alpaca.db")
 STREAM_TRADE_UPDATES = "alpaca:trade_updates"; STREAM_TRADE_UPDATES_DLQ = "alpaca:trade_updates:dlq"
 STREAM_OMS_COMMANDS = "alpaca:oms:commands";   STREAM_EMS_REQUESTS = "alpaca:ems:requests"
+STREAM_ALGO_REQUESTS = "alpaca:algo:requests"
+STREAM_OMS_EVENTS = "alpaca:oms:events";       STREAM_ALGO_EVENTS = "alpaca:algo:events"
+SET_OPEN_ORDERS = "alpaca:orders:open";        SET_ACTIVE_ALGOS = "alpaca:algos:active"
+STATE_TTL_S = 86400
 TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
 ACTIVE_STATUSES   = frozenset({"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding",
                                "pending_cancel", "pending_replace", "calculated", "held"})
@@ -31,5 +35,9 @@ Functions / classes (exact signatures):
 - `send_command(r, stream, payload: dict, timeout: float = 10.0) -> dict` — ensures `payload["cmd_id"]` (reuse `req_id` if present, else `new_id()`), `XADD stream {"json": json.dumps(payload, default=str)} maxlen=100000 approximate=True`, then `return wait_reply(r, payload["cmd_id"], timeout)`.
 - `wait_reply(r, cmd_id, timeout: float = 10.0) -> dict` — `BLPOP reply_key(cmd_id) timeout`; returns parsed dict, or `{"ok": False, "status": "timeout", "cmd_id": cmd_id, "error": f"no reply within {timeout}s"}`.
 - `send_reply(r, cmd_id, reply: dict) -> None` — `RPUSH` json + `EXPIRE 60` (pipeline).
+- `publish(r, stream, payload: dict, *, maxlen: int = 100000, buffer: SpillBuffer | None = None) -> None` — `redis_call(r.xadd, stream, {"json": json.dumps(payload, default=str)}, maxlen=maxlen, approximate=True, buffer=buffer)`.
+- Key helpers: `order_key(order_id) -> f"alpaca:order:{order_id}"`, `coid_key(cid) -> f"alpaca:coid:{cid}"`, `cmd_key(cmd_id) -> f"alpaca:cmd:{cmd_id}"`, `algo_key(algo_id) -> f"alpaca:algo:{algo_id}"`, `algo_slices_key(algo_id) -> f"alpaca:algo:{algo_id}:slices"`.
+- `hset_state(r, key, mapping: dict, *, ttl: int | None = None) -> None` — HSET with None values removed and every value `str(v)` (bools as "1"/"0", dicts/lists via json.dumps); if `ttl` is given also `EXPIRE key ttl`, else `PERSIST key`. Pipeline; plain redis errors propagate.
+- `normalize_order(order: dict) -> dict` — PURE. Input is an Alpaca order dict (from `trader._to_dict` or a Redis hash). Output keys exactly: `order_id` (from `id` or `order_id`, str), `client_order_id`, `symbol`, `side`, `type` (from `type` or `order_type`), `time_in_force`, `qty`, `limit_price`, `filled_qty`, `filled_avg_price`, `status`, `submitted_at`, `created_at`, `updated_at`. Enum-ish strings such as `"OrderSide.BUY"`, `"OrderStatus.NEW"`, `"TimeInForce.GTC"` or objects with `.value` become bare lowercase (`buy`, `new`, `gtc`); numerics become float or None (`""` → None); timestamps become ISO strings (datetime → isoformat) or None. Never raises on missing keys.
 
-Docstring at top explaining the resilience model in ~10 lines. Then call `mcp__verify__verify_stage(stage="runtime")`.
+If runtime.py already exists it is shown to you as EXISTING: keep every existing function's behaviour unchanged (the unit tests depend on it) and only ADD the new constants/helpers listed above, using Edit. Docstring at top explaining the resilience model in ~10 lines. Then call `mcp__verify__verify_stage(stage="runtime")`.
