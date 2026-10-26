@@ -11,6 +11,8 @@ STREAM_OMS_COMMANDS = "alpaca:oms:commands";   STREAM_EMS_REQUESTS = "alpaca:ems
 STREAM_ALGO_REQUESTS = "alpaca:algo:requests"
 STREAM_OMS_EVENTS = "alpaca:oms:events";       STREAM_ALGO_EVENTS = "alpaca:algo:events"
 SET_OPEN_ORDERS = "alpaca:orders:open";        SET_ACTIVE_ALGOS = "alpaca:algos:active"
+STREAM_CROSS_REQUESTS = "alpaca:cross:requests"; SET_RESTING = "alpaca:book:resting"
+CROSS_STATS_KEY = "alpaca:cross:stats";        DEFAULT_BOOK = "default"
 STATE_TTL_S = 86400
 TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
 ACTIVE_STATUSES   = frozenset({"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding",
@@ -36,7 +38,7 @@ Functions / classes (exact signatures):
 - `wait_reply(r, cmd_id, timeout: float = 10.0) -> dict` — `BLPOP reply_key(cmd_id) timeout`; returns parsed dict, or `{"ok": False, "status": "timeout", "cmd_id": cmd_id, "error": f"no reply within {timeout}s"}`.
 - `send_reply(r, cmd_id, reply: dict) -> None` — `RPUSH` json + `EXPIRE 60` (pipeline).
 - `publish(r, stream, payload: dict, *, maxlen: int = 100000, buffer: SpillBuffer | None = None) -> None` — `redis_call(r.xadd, stream, {"json": json.dumps(payload, default=str)}, maxlen=maxlen, approximate=True, buffer=buffer)`.
-- Key helpers: `order_key(order_id) -> f"alpaca:order:{order_id}"`, `coid_key(cid) -> f"alpaca:coid:{cid}"`, `cmd_key(cmd_id) -> f"alpaca:cmd:{cmd_id}"`, `algo_key(algo_id) -> f"alpaca:algo:{algo_id}"`, `algo_slices_key(algo_id) -> f"alpaca:algo:{algo_id}:slices"`.
+- Key helpers: `book_key(symbol, side) -> f"alpaca:book:{symbol}:{side}"`, `book_order_key(coid) -> f"alpaca:book:order:{coid}"`, `cross_stats_key(symbol) -> f"alpaca:cross:stats:{symbol}"`, `internal_order_id(coid) -> f"int-{coid}"`, `order_key(order_id) -> f"alpaca:order:{order_id}"`, `coid_key(cid) -> f"alpaca:coid:{cid}"`, `cmd_key(cmd_id) -> f"alpaca:cmd:{cmd_id}"`, `algo_key(algo_id) -> f"alpaca:algo:{algo_id}"`, `algo_slices_key(algo_id) -> f"alpaca:algo:{algo_id}:slices"`.
 - `hset_state(r, key, mapping: dict, *, ttl: int | None = None) -> None` — HSET with None values removed and every value `str(v)` (bools as "1"/"0", dicts/lists via json.dumps); if `ttl` is given also `EXPIRE key ttl`, else `PERSIST key`. Pipeline; plain redis errors propagate.
 - `normalize_order(order: dict) -> dict` — PURE. Input is an Alpaca order dict (from `trader._to_dict` or a Redis hash). Output keys exactly: `order_id` (from `id` or `order_id`, str), `client_order_id`, `symbol`, `side`, `type` (from `type` or `order_type`), `time_in_force`, `qty`, `limit_price`, `filled_qty`, `filled_avg_price`, `status`, `submitted_at`, `created_at`, `updated_at`. Enum-ish strings such as `"OrderSide.BUY"`, `"OrderStatus.NEW"`, `"TimeInForce.GTC"` or objects with `.value` become bare lowercase (`buy`, `new`, `gtc`); numerics become float or None (`""` → None); timestamps become ISO strings (datetime → isoformat) or None. Never raises on missing keys.
 

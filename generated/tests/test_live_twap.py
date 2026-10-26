@@ -24,6 +24,7 @@ def test_twap_end_to_end(live_redis, request):
     ensure_worker("subscriber")
     ensure_worker("trade_stream")
     ensure_oms_ems()
+    ensure_worker("crossing")
     ensure_worker("persister")
     ensure_worker("algo_engine")
 

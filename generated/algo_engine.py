@@ -20,7 +20,7 @@ import trader
 
 log = runtime.log("algo_engine")
 
-ALGO_FIELDS = ("algo_id", "strategy", "account", "symbol", "side", "total_qty", "n_slices", "start_ts",
+ALGO_FIELDS = ("algo_id", "strategy", "account", "book", "symbol", "side", "total_qty", "n_slices", "start_ts",
                "end_ts", "limit_cap", "params_json", "source", "status", "filled_qty", "avg_px", "error",
                "created_at", "updated_at")
 ALGO_FLOAT = ("total_qty", "start_ts", "end_ts", "limit_cap", "filled_qty", "avg_px")
@@ -77,6 +77,8 @@ def _typed_algo(h: dict) -> dict:
         out["n_slices"] = None
     if out.get("filled_qty") is None:
         out["filled_qty"] = 0.0
+    if not out.get("book"):
+        out["book"] = runtime.DEFAULT_BOOK
     return out
 
 
@@ -182,19 +184,47 @@ def save_slice(r, sl: dict, *, emit: bool = True) -> None:
             log.error("publish slice event failed: %s", e)
 
 
+_INTERNAL_STATUS_MAP = {"accepted": "accepted", "partially_filled": "partially_filled",
+                        "new": "accepted", "pending_new": "accepted",
+                        "filled": "filled", "replaced": "accepted",
+                        "canceled": "canceled", "rejected": "rejected", "expired": "expired"}
+
+
 def child_state(r, client_order_id) -> dict | None:
+    """Combined state of an algo child: internal (crossed) record + exchange record."""
     if not client_order_id:
         return None
     try:
-        oid = runtime.redis_call(r.get, runtime.coid_key(client_order_id))
-        if not oid:
+        int_id = runtime.internal_order_id(client_order_id)
+        ih = runtime.redis_call(r.hgetall, runtime.order_key(int_id)) or {}
+        xh = {}
+        xid = runtime.redis_call(r.get, runtime.coid_key(client_order_id))
+        if xid and not str(xid).startswith("int-"):
+            xh = runtime.redis_call(r.hgetall, runtime.order_key(xid)) or {}
+        if not ih and not xh:
             return None
-        h = runtime.redis_call(r.hgetall, runtime.order_key(oid))
-        if not h:
-            return None
-        return {"order_id": h.get("order_id") or oid, "status": (h.get("status") or None),
-                "filled_qty": _f(h.get("filled_qty")) or 0.0,
-                "filled_avg_price": _f(h.get("filled_avg_price"))}
+        ifq = _f(ih.get("filled_qty")) or 0.0 if ih else 0.0
+        xfq = _f(xh.get("filled_qty")) or 0.0 if xh else 0.0
+        ipx = _f(ih.get("filled_avg_price")) if ih else None
+        xpx = _f(xh.get("filled_avg_price")) if xh else None
+        notional = 0.0
+        priced = 0.0
+        if ifq > 0 and ipx is not None:
+            notional += ifq * ipx
+            priced += ifq
+        if xfq > 0 and xpx is not None:
+            notional += xfq * xpx
+            priced += xfq
+        avg = (notional / priced) if priced > 0 else None
+        if xh:
+            order_id = xh.get("order_id") or xid
+            status = xh.get("status") or None
+        else:
+            order_id = ih.get("order_id") or int_id
+            ist = ih.get("status") or None
+            status = _INTERNAL_STATUS_MAP.get(ist, ist)
+        return {"order_id": order_id, "status": status, "filled_qty": ifq + xfq,
+                "filled_avg_price": avg, "internal_filled_qty": ifq, "external_filled_qty": xfq}
     except Exception as e:
         log.warning("child_state %s failed: %s", client_order_id, e)
         return None
@@ -206,6 +236,7 @@ def submit_child(r, algo: dict, sl: dict, px, tif: str) -> dict:
         "kind": "submit", "account": algo.get("account") or "paper",
         "client_order_id": sl["client_order_id"], "symbol": algo["symbol"], "side": algo["side"],
         "type": "limit", "qty": sl["qty"], "limit_price": px, "tif": tif, "source": "algo",
+        "book": algo.get("book") or runtime.DEFAULT_BOOK,
         "algo_id": algo["algo_id"], "slice_idx": sl["slice_idx"]}, timeout=10)
 
 
@@ -281,7 +312,9 @@ def _create(r, p: dict) -> dict:
 
     algo_id = runtime.new_id()
     now = runtime.now_iso()
-    algo = {"algo_id": algo_id, "strategy": strategy, "account": account, "symbol": symbol, "side": side,
+    book = str(p.get("book") or runtime.DEFAULT_BOOK)
+    algo = {"algo_id": algo_id, "strategy": strategy, "account": account, "book": book,
+            "symbol": symbol, "side": side,
             "total_qty": total_qty, "n_slices": len(sched), "start_ts": start, "end_ts": end,
             "limit_cap": limit_cap, "params_json": json.dumps(params, default=str),
             "source": p.get("source"), "status": "pending", "filled_qty": 0.0, "avg_px": None,

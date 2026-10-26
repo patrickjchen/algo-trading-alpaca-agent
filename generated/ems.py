@@ -1,8 +1,8 @@
 """EMS worker: the exchange gateway. The ONLY process calling Alpaca order endpoints (via trader.py).
 
-Serves submit / cancel_order requests from OMS on ``alpaca:ems:requests`` (group ``ems``), replies on
-``alpaca:reply:<cmd_id>`` and publishes an EXECUTION REPORT to ``alpaca:trade_updates`` for each
-successful exchange action. No algo logic, no SQLite. No I/O at import time.
+Serves submit / cancel_order requests from crossing.py on alpaca:ems:requests and publishes an
+execution report to alpaca:trade_updates for each successful exchange interaction.
+No algo logic, no SQLite.
 """
 from __future__ import annotations
 
@@ -20,10 +20,14 @@ log = runtime.log("ems")
 
 COID_RE = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
 RETRY_DELAYS = (0.5, 1.0, 2.0)
-_sleep = time.sleep
+
+_spill = runtime.SpillBuffer()
 
 
-# --------------------------------------------------------------------------- helpers
+def _sleep(s: float) -> None:
+    time.sleep(s)
+
+
 def _status_code(exc):
     try:
         return exc.status_code
@@ -32,16 +36,15 @@ def _status_code(exc):
 
 
 def _err_text(exc) -> str:
-    msg = None
-    if isinstance(exc, APIError):
-        try:
-            msg = exc.message
-        except Exception:
-            msg = None
-    return str(msg or exc)[:500]
+    try:
+        info = trader.error_info(exc)
+        msg = info.get("message") or str(exc)
+    except Exception:
+        msg = str(exc)
+    return str(msg)[:500]
 
 
-def _float(x):
+def _f(x):
     if x is None or x == "":
         return None
     try:
@@ -50,189 +53,189 @@ def _float(x):
         return None
 
 
-def _is_transient(exc) -> bool:
-    if isinstance(exc, RuntimeError):
-        return False
-    try:
-        return bool(trader.is_transient(exc))
-    except Exception:
-        return False
-
-
-def _order_dict(res):
-    if res is None:
-        return None
-    if isinstance(res, dict):
-        return res
-    try:
-        d = trader._to_dict(res)
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
-
-
 # --------------------------------------------------------------------------- reports
 def publish_report(r, event: str, order: dict | None, *, account, client_order_id=None, order_id=None,
-                   symbol=None, side=None, qty=None, source=None, algo_id=None, slice_idx=None) -> None:
+                   symbol=None, side=None, qty=None, source=None, algo_id=None, slice_idx=None,
+                   book=None) -> None:
     try:
-        o = order or {}
-        if order_id is None:
-            order_id = o.get("id") or o.get("order_id")
-        if client_order_id is None:
-            client_order_id = o.get("client_order_id")
-        if symbol is None:
-            symbol = o.get("symbol")
-        if side is None:
-            side = runtime._enum_str(o.get("side"))
-        if qty is None:
-            qty = _float(o.get("qty"))
-        payload = {
-            "event": event, "execution_id": None,
-            "order_id": str(order_id) if order_id is not None else None,
-            "client_order_id": client_order_id, "symbol": symbol, "side": side,
-            "price": None, "qty": qty, "position_qty": None, "ts": runtime.now_iso(),
-            "account": account, "order": order, "source": source, "algo_id": algo_id,
-            "slice_idx": slice_idx,
-        }
         if r is None:
             return
-        runtime.publish(r, runtime.STREAM_TRADE_UPDATES, payload)
-    except Exception as e:  # never raise
-        log.error("publish_report %s failed: %s", event, e)
+        o = order or {}
+        norm = runtime.normalize_order(o) if o else {}
+        payload = {
+            "event": event,
+            "execution_id": None,
+            "order_id": order_id or norm.get("order_id"),
+            "client_order_id": client_order_id or norm.get("client_order_id"),
+            "symbol": symbol or norm.get("symbol"),
+            "side": side or norm.get("side"),
+            "price": None,
+            "qty": qty if qty is not None else norm.get("qty"),
+            "position_qty": None,
+            "ts": runtime.now_iso(),
+            "account": account,
+            "order": order,
+            "source": source,
+            "algo_id": algo_id,
+            "slice_idx": slice_idx,
+            "book": book,
+            "venue": "alpaca",
+        }
+        runtime.publish(r, runtime.STREAM_TRADE_UPDATES, payload, buffer=_spill)
+    except Exception:
+        log.exception("publish_report failed event=%s", event)
 
 
 # --------------------------------------------------------------------------- submit
 def _validate_submit(p: dict):
     side = str(p.get("side") or "").lower()
-    typ = str(p.get("type") or "").lower()
-    tif = str(p.get("tif") or p.get("time_in_force") or "gtc").lower()
+    otype = str(p.get("type") or "market").lower()
+    tif = str(p.get("tif") or "gtc").lower()
     coid = p.get("client_order_id")
-    qty = _float(p.get("qty"))
-    lp = _float(p.get("limit_price"))
     if side not in ("buy", "sell"):
-        return "side must be buy or sell", None
-    if typ not in ("market", "limit"):
-        return "type must be market or limit", None
+        return None, "side must be buy or sell"
+    if otype not in ("market", "limit"):
+        return None, "type must be market or limit"
+    qty = _f(p.get("qty"))
     if qty is None or qty <= 0:
-        return "qty must be > 0", None
-    if typ == "limit" and (lp is None or lp <= 0):
-        return "limit order requires limit_price > 0", None
+        return None, "qty must be > 0"
+    limit_price = _f(p.get("limit_price"))
+    if otype == "limit" and (limit_price is None or limit_price <= 0):
+        return None, "limit order requires limit_price > 0"
     if tif not in ("gtc", "ioc"):
-        return "tif must be gtc or ioc", None
+        return None, "tif must be gtc or ioc"
     if not isinstance(coid, str) or not COID_RE.match(coid):
-        return "client_order_id must match ^[A-Za-z0-9_-]{1,48}$", None
-    if not p.get("symbol"):
-        return "symbol required", None
-    return None, {"side": side, "type": typ, "tif": tif, "coid": coid, "qty": qty,
-                  "limit_price": lp if typ == "limit" else None, "symbol": str(p["symbol"])}
+        return None, "client_order_id must match ^[A-Za-z0-9_-]{1,48}$"
+    symbol = p.get("symbol")
+    if not symbol or not isinstance(symbol, str):
+        return None, "symbol required"
+    return {"side": side, "type": otype, "tif": tif, "qty": qty, "limit_price": limit_price,
+            "client_order_id": coid, "symbol": symbol}, None
 
 
 def execute_submit(r, p: dict) -> dict:
     p = p or {}
+    account = "live" if str(p.get("account") or "paper").lower() == "live" else "paper"
+    live = account == "live"
+    v, err = _validate_submit(p)
     coid = p.get("client_order_id")
-    err, v = _validate_submit(p)
     if err:
         return {"ok": False, "status": "rejected", "order_id": None, "client_order_id": coid,
                 "order": None, "error": err}
-    account = "live" if p.get("account") == "live" else "paper"
-    live = account == "live"
-    source, algo_id, slice_idx = p.get("source"), p.get("algo_id"), p.get("slice_idx")
-    coid = v["coid"]
+    coid = v["client_order_id"]
+    rep_kw = dict(account=account, source=p.get("source"), algo_id=p.get("algo_id"),
+                  slice_idx=p.get("slice_idx"), book=p.get("book"))
 
-    def _ok(status, order):
-        publish_report(r, "ems_submitted", order, account=account, source=source,
-                       algo_id=algo_id, slice_idx=slice_idx)
-        return {"ok": True, "status": status, "order_id": str(order.get("id") or order.get("order_id")),
-                "client_order_id": order.get("client_order_id") or coid, "order": order, "error": None}
+    def _ok(order, status):
+        order = trader._to_dict(order) if not isinstance(order, dict) else order
+        norm = runtime.normalize_order(order or {})
+        publish_report(r, "ems_submitted", order, client_order_id=coid, **rep_kw)
+        return {"ok": True, "status": status, "order_id": norm.get("order_id"),
+                "client_order_id": coid, "order": order, "error": None}
 
     def _fail(status, error):
         return {"ok": False, "status": status, "order_id": None, "client_order_id": coid,
                 "order": None, "error": error}
 
-    def _lookup():
-        return _order_dict(trader.get_order_by_client_id(coid, live))
-
-    attempt = 0
-    while True:
+    last_exc = None
+    attempts = len(RETRY_DELAYS) + 1
+    for attempt in range(attempts):
         try:
             if v["type"] == "limit":
                 res = trader.submit_limit(v["symbol"], v["qty"], v["side"], v["limit_price"], coid,
                                           live=live, tif=v["tif"])
             else:
-                res = trader.submit_market(v["symbol"], v["qty"], v["side"], coid, live=live, tif=v["tif"])
-            order = _order_dict(res) or {}
-            return _ok("acked", order)
+                res = trader.submit_market(v["symbol"], v["qty"], v["side"], coid, live=live,
+                                           tif=v["tif"])
+            return _ok(res, "acked")
+        except APIError as e:
+            sc = _status_code(e)
+            text = _err_text(e)
+            if sc == 422 and "client_order_id" in (text + " " + str(e)).lower():
+                try:
+                    existing = trader.get_order_by_client_id(coid, live)
+                except Exception as e2:
+                    return _fail("rejected", f"{text}; lookup failed: {type(e2).__name__}: {e2}")
+                if existing:
+                    return _ok(existing, "already_submitted")
+                return _fail("rejected", text)
+            if trader.is_transient(e):
+                last_exc = e
+            else:
+                return _fail("rejected", text)
         except Exception as e:
-            sc = _status_code(e) if isinstance(e, APIError) else None
-            if isinstance(e, APIError) and sc == 422 and "client_order_id" in str(e).lower():
-                try:
-                    found = _lookup()
-                except Exception as e2:
-                    return _fail("rejected", f"{_err_text(e)}; lookup failed: {e2}")
-                if found:
-                    return _ok("already_submitted", found)
-                return _fail("rejected", _err_text(e))
-            if _is_transient(e):
-                if attempt < len(RETRY_DELAYS):
-                    log.warning("submit coid=%s transient error (attempt %d): %s", coid, attempt + 1, e)
-                    _sleep(RETRY_DELAYS[attempt])
-                    attempt += 1
-                    continue
-                try:
-                    found = _lookup()
-                except Exception as e2:
-                    found = None
-                    log.warning("submit coid=%s lookup after retries failed: %s", coid, e2)
-                if found:
-                    return _ok("acked", found)
-                return _fail("unknown", f"{type(e).__name__}: {_err_text(e)}")
-            if isinstance(e, APIError) and sc is not None and 400 <= sc < 500:
-                return _fail("rejected", _err_text(e))
-            return _fail("error", f"{type(e).__name__}: {e}")
+            if isinstance(e, RuntimeError) or not trader.is_transient(e):
+                return _fail("error", f"{type(e).__name__}: {e}")
+            last_exc = e
+        if attempt < len(RETRY_DELAYS):
+            log.warning("submit coid=%s transient error (attempt %d): %s", coid, attempt + 1, last_exc)
+            _sleep(RETRY_DELAYS[attempt])
+
+    try:
+        existing = trader.get_order_by_client_id(coid, live)
+    except Exception as e2:
+        existing = None
+        log.warning("lookup coid=%s after retries failed: %s", coid, e2)
+    if existing:
+        return _ok(existing, "acked")
+    return _fail("unknown", f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown")
 
 
 # --------------------------------------------------------------------------- cancel
 def execute_cancel(r, p: dict) -> dict:
     p = p or {}
-    account = "live" if p.get("account") == "live" else "paper"
+    account = "live" if str(p.get("account") or "paper").lower() == "live" else "paper"
     live = account == "live"
-    coid = p.get("client_order_id")
-    source = p.get("source")
     order_id = p.get("order_id")
+    coid = p.get("client_order_id")
     try:
         if not order_id and coid and r is not None:
             try:
                 order_id = runtime.redis_call(r.get, runtime.coid_key(coid))
             except Exception as e:
                 log.warning("coid lookup in redis failed: %s", e)
+                order_id = None
+            if order_id and str(order_id).startswith("int-"):
+                order_id = None
         if not order_id and coid:
-            found = _order_dict(trader.get_order_by_client_id(coid, live))
-            if found:
-                order_id = found.get("id") or found.get("order_id")
+            existing = trader.get_order_by_client_id(coid, live)
+            if existing:
+                order_id = existing.get("id") or existing.get("order_id")
     except Exception as e:
-        return {"ok": False, "status": "error", "order_id": None, "error": f"{type(e).__name__}: {e}"}
+        return {"ok": False, "status": "error", "order_id": None, "client_order_id": coid,
+                "error": f"{type(e).__name__}: {e}"}
     if not order_id:
-        return {"ok": False, "status": "not_found", "order_id": None, "error": "order not found"}
+        return {"ok": False, "status": "not_found", "order_id": None, "client_order_id": coid,
+                "error": "order not found"}
     order_id = str(order_id)
 
-    attempt = 0
-    while True:
+    last_exc = None
+    for attempt in range(len(RETRY_DELAYS) + 1):
         try:
             trader.cancel(order_id, live)
             publish_report(r, "ems_cancel_requested", None, account=account, order_id=order_id,
-                           client_order_id=coid, source=source)
-            return {"ok": True, "status": "cancel_requested", "order_id": order_id, "error": None}
+                           client_order_id=coid, source=p.get("source"))
+            return {"ok": True, "status": "cancel_requested", "order_id": order_id,
+                    "client_order_id": coid, "error": None}
+        except APIError as e:
+            sc = _status_code(e)
+            if sc in (404, 422):
+                return {"ok": False, "status": "not_found", "order_id": order_id,
+                        "client_order_id": coid, "error": _err_text(e)}
+            if not trader.is_transient(e):
+                return {"ok": False, "status": "error", "order_id": order_id,
+                        "client_order_id": coid, "error": _err_text(e)}
+            last_exc = e
         except Exception as e:
-            sc = _status_code(e) if isinstance(e, APIError) else None
-            if isinstance(e, APIError) and sc in (404, 422):
-                return {"ok": False, "status": "not_found", "order_id": order_id, "error": _err_text(e)}
-            if _is_transient(e) and attempt < len(RETRY_DELAYS):
-                log.warning("cancel %s transient error (attempt %d): %s", order_id, attempt + 1, e)
-                _sleep(RETRY_DELAYS[attempt])
-                attempt += 1
-                continue
-            return {"ok": False, "status": "error", "order_id": order_id,
-                    "error": f"{type(e).__name__}: {_err_text(e)}"}
+            if isinstance(e, RuntimeError) or not trader.is_transient(e):
+                return {"ok": False, "status": "error", "order_id": order_id,
+                        "client_order_id": coid, "error": f"{type(e).__name__}: {e}"}
+            last_exc = e
+        if attempt < len(RETRY_DELAYS):
+            log.warning("cancel %s transient error (attempt %d): %s", order_id, attempt + 1, last_exc)
+            _sleep(RETRY_DELAYS[attempt])
+    return {"ok": False, "status": "error", "order_id": order_id, "client_order_id": coid,
+            "error": f"{type(last_exc).__name__}: {last_exc}" if last_exc else "cancel failed"}
 
 
 # --------------------------------------------------------------------------- dispatch
@@ -243,13 +246,15 @@ def handle_request(r, payload: dict) -> dict:
     try:
         if kind == "submit":
             reply = execute_submit(r, payload)
-            log.info("submit coid=%s %s %s qty=%s px=%s -> %s", payload.get("client_order_id"),
+            log.info("submit coid=%s %s %s qty=%s px=%s -> %s%s", payload.get("client_order_id"),
                      payload.get("symbol"), payload.get("side"), payload.get("qty"),
-                     payload.get("limit_price"), reply.get("status"))
+                     payload.get("limit_price"), reply.get("status"),
+                     f" ({reply.get('error')})" if reply.get("error") else "")
         elif kind == "cancel_order":
             reply = execute_cancel(r, payload)
-            log.info("cancel order_id=%s coid=%s -> %s", payload.get("order_id"),
-                     payload.get("client_order_id"), reply.get("status"))
+            log.info("cancel order_id=%s coid=%s -> %s%s", payload.get("order_id"),
+                     payload.get("client_order_id"), reply.get("status"),
+                     f" ({reply.get('error')})" if reply.get("error") else "")
         else:
             reply = {"ok": False, "status": "error", "error": "unknown kind"}
     except Exception as e:
@@ -259,52 +264,59 @@ def handle_request(r, payload: dict) -> dict:
     if r is not None and cmd_id:
         try:
             runtime.redis_call(runtime.send_reply, r, cmd_id, reply)
-        except Exception as e:
-            log.error("send_reply %s failed: %s", cmd_id, e)
+        except Exception:
+            log.exception("send_reply failed cmd_id=%s", cmd_id)
     return reply
+
+
+def _parse_entry(fields: dict) -> dict:
+    raw = (fields or {}).get("json")
+    if raw is None:
+        return dict(fields or {})
+    d = json.loads(raw)
+    if not isinstance(d, dict):
+        raise ValueError("payload is not an object")
+    return d
 
 
 def process_requests(r, reader) -> int:
     entries = reader.read()
     n = 0
-    for entry_id, fields in entries:
+    for eid, fields in entries:
         payload = None
         try:
-            payload = json.loads(fields.get("json") or "{}")
-            if not isinstance(payload, dict):
-                raise ValueError("payload is not an object")
+            payload = _parse_entry(fields)
             handle_request(r, payload)
-            reader.ack(entry_id)
+            reader.ack(eid)
+            n += 1
         except Exception as e:
-            log.exception("request %s failed", entry_id)
+            log.exception("request %s failed", eid)
             try:
-                reader.dead_letter(entry_id, fields, f"{type(e).__name__}: {e}")
-            except Exception as e2:
-                log.error("dead_letter %s failed: %s", entry_id, e2)
-            cmd_id = (payload or {}).get("cmd_id") or (payload or {}).get("req_id") \
-                if isinstance(payload, dict) else None
+                reader.dead_letter(eid, fields, f"{type(e).__name__}: {e}")
+            except Exception:
+                log.exception("dead_letter failed for %s", eid)
+            cmd_id = (payload or {}).get("cmd_id") or (payload or {}).get("req_id")
             if cmd_id:
                 try:
                     runtime.send_reply(r, cmd_id, {"ok": False, "status": "error", "cmd_id": cmd_id,
                                                    "error": f"{type(e).__name__}: {e}"})
                 except Exception:
                     pass
-        n += 1
-    return n
+    return len(entries)
 
 
-def body():
+def body() -> None:
     r = runtime.get_redis()
     consumer = os.environ.get("EMS_CONSUMER", "ems-1")
     reader = runtime.GroupReader(r, runtime.STREAM_EMS_REQUESTS, "ems", consumer, block_ms=500)
-    log.info("ems started consumer=%s", consumer)
+    log.info("ems started consumer=%s stream=%s", consumer, runtime.STREAM_EMS_REQUESTS)
     while True:
         n = process_requests(r, reader)
         if not n:
             time.sleep(0.02)
 
 
-def main():
+def main() -> None:
     runtime.run_forever(body, "ems")
 
 

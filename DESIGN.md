@@ -29,14 +29,16 @@ Flask `url_map` rules (webgui) / required substrings (HTML) / `pytest` (test sta
  Alpaca trading WS ─► trade_stream.py ─► Redis Stream alpaca:trade_updates ─┬─► oms.py (group oms)      → live hashes alpaca:order:<id>, alpaca:coid:<coid>, alpaca:orders:open
  ems.py execution reports (ems_submitted / ems_cancel_requested) ─────────────┘ └─► persister.py (group persister) → SQLite orders/fills/trade_events
  webgui.py / cli.py / algo_engine.py ── XADD alpaca:oms:commands (submit/cancel/algo_create/algo_cancel) ──► oms.py ── reply alpaca:reply:<cmd_id>
- oms.py ── XADD alpaca:ems:requests (submit/cancel_order) ──► ems.py ──► Alpaca REST (the ONLY order writer)
+ oms.py ── XADD alpaca:cross:requests (submit/cancel_order) ──► crossing.py (central liquidity book: nets/crosses
+            offsetting internal interest at mid, rests limits for CROSS_HOLD_S, internal_* events → trade_updates)
+ crossing.py ── XADD alpaca:ems:requests (residual submit / cancel_order) ──► ems.py ──► Alpaca REST (the ONLY order writer)
  oms.py ── XADD alpaca:algo:requests (create/cancel) ──► algo_engine.py → live hashes alpaca:algo:<id>, :slices, alpaca:algos:active
  oms.py ── XADD alpaca:oms:events (order/command snapshots) ──► persister.py ──► SQLite orders/commands
  algo_engine.py ── XADD alpaca:algo:events (algo/slice snapshots) ──► persister.py ──► SQLite algo_orders/algo_slices
  (SQLite is written ONLY by persister.py, off the hot path; webgui/cli read it for history and read Redis for live state)
  every worker ──► alpaca:heartbeat:<name> (EX 15) ──► webgui /api/health, cli health, live tests
  oms_ems.py ──► runs oms.body + ems.body as two supervised threads in one process (both heartbeats kept)
- processes: subscriber, trade_stream, oms_ems, algo_engine, persister, webgui
+ processes: subscriber, trade_stream, oms_ems, crossing, algo_engine, persister, webgui
 ```
 
 ### Submit path (sequence)

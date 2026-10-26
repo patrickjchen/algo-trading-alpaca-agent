@@ -18,7 +18,7 @@ def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     d = r.get_json()
-    assert set(d["workers"]) >= {"subscriber", "trade_stream", "oms", "ems", "algo_engine",
+    assert set(d["workers"]) >= {"subscriber", "trade_stream", "oms", "ems", "crossing", "algo_engine",
                                  "persister", "webgui"}
     assert all(w["alive"] is False for w in d["workers"].values())
     assert d["db"] is False
@@ -82,6 +82,60 @@ def test_post_order_ok(client, fake_redis, monkeypatch):
     assert r.status_code == 200 and r.get_json()["status"] == "acked"
     assert sent[0][0] == runtime.STREAM_OMS_COMMANDS
     assert sent[0][1]["account"] == "paper" and sent[0][1]["kind"] == "submit"
+
+
+def test_post_order_book(client, fake_redis, monkeypatch):
+    runtime.Heartbeat(fake_redis, "oms").beat()
+    sent = _capture(monkeypatch, {"ok": True, "status": "acked"})
+    assert client.post("/api/order", json={**GOOD, "book": "A"}).status_code == 200
+    assert client.post("/api/order", json=GOOD).status_code == 200
+    assert sent[0][1]["book"] == "A"
+    assert sent[1][1]["book"] == runtime.DEFAULT_BOOK
+    assert all(s == runtime.STREAM_OMS_COMMANDS for s, _ in sent)
+
+
+def test_cross_stats(client, fake_redis):
+    d = client.get("/api/cross/stats").get_json()
+    assert d == {"total": {}, "by_symbol": {}}
+    fake_redis.hset(runtime.CROSS_STATS_KEY, mapping={"crosses": "2", "crossed_qty": "0.5"})
+    fake_redis.hset(runtime.cross_stats_key("BTC/USD"), mapping={"crosses": "2"})
+    d = client.get("/api/cross/stats").get_json()
+    assert d["total"]["crosses"] == 2.0 and d["total"]["crossed_qty"] == 0.5
+    assert d["by_symbol"]["BTC/USD"]["crosses"] == 2.0
+
+
+def test_cross_book(client, fake_redis):
+    d = client.get("/api/cross/book/BTC%2FUSD").get_json()
+    assert d["bids"] == [] and d["asks"] == []
+    fake_redis.zadd(runtime.book_key("BTC/USD", "buy"), {"tc-1": 100.0})
+    fake_redis.hset(runtime.book_order_key("tc-1"), mapping={"status": "resting", "remaining": "0.5",
+                                                             "qty": "1", "book": "A", "type": "limit"})
+    d = client.get("/api/cross/book/BTC%2FUSD").get_json()
+    assert len(d["bids"]) == 1 and d["asks"] == []
+    assert d["bids"][0]["price"] == 100.0 and d["bids"][0]["qty"] == 0.5 and d["bids"][0]["book"] == "A"
+
+
+def test_summary_positions_by_book(client, tmp_path, monkeypatch, no_creds):
+    import persister
+    db = str(tmp_path / "summary.db")
+    monkeypatch.setattr(runtime, "DB_PATH", db)
+    conn = runtime.sqlite_connect(db)
+    persister.setup_db(conn)
+    conn.execute("INSERT INTO fills(execution_id, order_id, account, symbol, side, price, qty, event, ts, "
+                 "book, venue) VALUES('x-1-b','int-tc-1','paper','BTC/USD','buy',100,1.0,'internal_fill',"
+                 "'2026-01-01T00:00:00','A','internal')")
+    conn.execute("INSERT INTO fills(execution_id, order_id, account, symbol, side, price, qty, event, ts, "
+                 "book, venue) VALUES('e-2','ex-2','paper','BTC/USD','sell',101,0.4,'fill',"
+                 "'2026-01-01T00:00:01','A','alpaca')")
+    conn.commit()
+    conn.close()
+    r = client.get("/api/summary")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert isinstance(d["crossing"], dict)
+    rows = [x for x in d["positions_by_book"] if x["book"] == "A" and x["symbol"] == "BTC/USD"]
+    assert len(rows) == 1 and rows[0]["qty"] == pytest.approx(0.6)
+    assert d["realized_pnl_by_symbol"]["BTC/USD"] == pytest.approx(0.4)
 
 
 def test_strategies(client):
