@@ -46,6 +46,10 @@ STREAM_OMS_EVENTS = "alpaca:oms:events"
 STREAM_ALGO_EVENTS = "alpaca:algo:events"
 SET_OPEN_ORDERS = "alpaca:orders:open"
 SET_ACTIVE_ALGOS = "alpaca:algos:active"
+STREAM_CROSS_REQUESTS = "alpaca:cross:requests"
+SET_RESTING = "alpaca:book:resting"
+CROSS_STATS_KEY = "alpaca:cross:stats"
+DEFAULT_BOOK = "default"
 STATE_TTL_S = 86400
 TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
 ACTIVE_STATUSES = frozenset({"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding",
@@ -390,6 +394,10 @@ def coid_key(cid) -> str: return f"alpaca:coid:{cid}"
 def cmd_key(cmd_id) -> str: return f"alpaca:cmd:{cmd_id}"
 def algo_key(algo_id) -> str: return f"alpaca:algo:{algo_id}"
 def algo_slices_key(algo_id) -> str: return f"alpaca:algo:{algo_id}:slices"
+def book_key(symbol, side) -> str: return f"alpaca:book:{symbol}:{side}"
+def book_order_key(coid) -> str: return f"alpaca:book:order:{coid}"
+def cross_stats_key(symbol) -> str: return f"alpaca:cross:stats:{symbol}"
+def internal_order_id(coid) -> str: return f"int-{coid}"
 
 
 def _sval(v) -> str:

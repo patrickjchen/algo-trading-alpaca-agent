@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the six pipeline processes with a restart-on-exit loop each (oms_ems hosts OMS + EMS).
+# Start the seven pipeline processes with a restart-on-exit loop each (oms_ems hosts OMS + EMS).
 # Usage: source run.bash (sets ALPACA_* / REDIS_URL / ALPACA_DB_PATH), then scripts/run_all.sh
 # Stop:  Ctrl-C (kills the whole process group) or scripts/run_all.sh stop
 set -u
@@ -26,7 +26,7 @@ supervise() {  # supervise <name> -- restart if the process ever exits (runtime.
   done
 }
 : > "$PIDFILE"
-for w in subscriber trade_stream oms_ems algo_engine persister webgui; do
+for w in subscriber trade_stream oms_ems crossing algo_engine persister webgui; do
   supervise "$w" & echo $! >> "$PIDFILE"
 done
 echo "[run_all] workers started; logs in $LOGDIR; UI on http://${WEBGUI_HOST:-127.0.0.1}:${WEBGUI_PORT:-5000}"

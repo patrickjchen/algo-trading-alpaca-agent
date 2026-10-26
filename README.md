@@ -16,6 +16,10 @@ Compared with the AG2/Gemini predecessor (`../TradingWithAlpaca` (the AG2/Gemini
   submit/cancel. OMS and EMS run in one `oms_ems` process.
 * **Algo engine** — the strategy service: TWAP scheduling with restart-safe state, children routed
   through OMS. VWAP and Implementation Shortfall registered as stubs and shown disabled in the GUI.
+* **Internal crossing (central liquidity book)** — offsetting interest from different books on the
+  same symbol is matched internally at the midpoint before anything is routed to the exchange,
+  saving both legs' fees and half the spread; only the residual goes out. Savings are tallied and
+  shown in the GUI.
 * **Persister** — the only SQLite writer; drains the Redis streams into the history tables in
   batches, so no trading worker ever blocks on disk.
 * **Fault tolerance** — supervisor with backoff, heartbeats, Redis retry + spill buffer, WAL SQLite,
@@ -38,7 +42,7 @@ python claude_codegen.py --stage all    # regenerate everything
 ```bash
 cp run.bash.example run.bash && $EDITOR run.bash && source run.bash
 docker run -d -p 6379:6379 redis
-scripts/run_all.sh                      # subscriber, trade_stream, oms_ems, algo_engine, persister, webgui -> http://127.0.0.1:5000
+scripts/run_all.sh                      # subscriber, trade_stream, oms_ems, crossing, algo_engine, persister, webgui -> http://127.0.0.1:5000
 cd generated && python cli.py health && python cli.py twap BTC/USD buy 0.0002 --duration 60 --slices 2
 python -m pytest -q generated/tests -m "not live"     # offline
 python -m pytest -q generated/tests -m live           # needs creds + Redis + workers

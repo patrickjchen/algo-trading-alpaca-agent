@@ -99,6 +99,50 @@ def test_oms_command_and_order(fake_redis, db_conn):
     assert o["source"] == "webgui" and o["status"] == "accepted"
 
 
+def _internal(event, status, exec_id=None, **order_extra):
+    order = {"id": "int-tc-9", "client_order_id": "tc-9", "symbol": "BTC/USD", "side": "buy",
+             "type": "limit", "time_in_force": "gtc", "qty": 1.0, "limit_price": 100.0,
+             "filled_qty": 0.4 if exec_id else 0.0, "filled_avg_price": 99.5 if exec_id else None,
+             "status": status, "venue": "internal", "book": "A"}
+    order.update(order_extra)
+    p = {"event": event, "execution_id": exec_id, "order_id": "int-tc-9", "client_order_id": "tc-9",
+         "symbol": "BTC/USD", "side": "buy", "price": 99.5 if exec_id else None,
+         "qty": 0.4 if exec_id else None, "ts": runtime.now_iso(), "account": "paper",
+         "order": order, "venue": "internal", "book": "A"}
+    if exec_id:
+        p.update(cross_id="cx1", counter_client_order_id="tc-10", counter_book="B")
+    return p
+
+
+def test_internal_fill(fake_redis, db_conn):
+    rd = _reader(fake_redis, TU)
+    _xadd(fake_redis, TU, _internal("internal_fill", "partially_filled", exec_id="x-cx1-b"))
+    persister.process_batch(db_conn, rd, persister.handle_trade_update)
+    f = db_conn.execute("SELECT venue, cross_id, counter_client_order_id, book, price, qty FROM fills").fetchone()
+    assert f["venue"] == "internal" and f["cross_id"] == "cx1"
+    assert f["counter_client_order_id"] == "tc-10" and f["book"] == "A"
+    assert f["price"] == 99.5 and f["qty"] == 0.4
+    o = db_conn.execute("SELECT venue, book, status FROM orders WHERE order_id='int-tc-9'").fetchone()
+    assert o["venue"] == "internal" and o["book"] == "A" and o["status"] == "partially_filled"
+
+
+def test_alpaca_fill_venue(fake_redis, db_conn):
+    rd = _reader(fake_redis, TU)
+    _xadd(fake_redis, TU, _tu("fill", "filled", "0.01", exec_id="e1"))
+    persister.process_batch(db_conn, rd, persister.handle_trade_update)
+    assert db_conn.execute("SELECT venue FROM fills").fetchone()[0] == "alpaca"
+
+
+def test_internal_routed(fake_redis, db_conn):
+    rd = _reader(fake_redis, TU)
+    _xadd(fake_redis, TU, _internal("internal_accepted", "accepted"))
+    _xadd(fake_redis, TU, _internal("internal_routed", "replaced", routed_order_id="ex-77"))
+    persister.process_batch(db_conn, rd, persister.handle_trade_update)
+    o = db_conn.execute("SELECT routed_order_id, status FROM orders WHERE order_id='int-tc-9'").fetchone()
+    assert o["routed_order_id"] == "ex-77" and o["status"] == "replaced"
+    assert _count(db_conn, "fills") == 0
+
+
 def _slice(aid, i, status="scheduled", filled=0.0):
     return {"algo_id": aid, "slice_idx": i, "scheduled_ts": 1000.0 + i * 10, "qty": 0.01,
             "client_order_id": f"algo-{aid[:12]}-{i:03d}", "order_id": None, "limit_price": None,

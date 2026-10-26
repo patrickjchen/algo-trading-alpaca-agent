@@ -234,3 +234,4 @@ api_keys
 *.key
 .logs/
 simple.bash
+*.pdf

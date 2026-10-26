@@ -1,10 +1,15 @@
-"""OMS worker: front door for every order intent and owner of the order LIFECYCLE.
+"""Order Management System worker: the FRONT DOOR for every order intent and owner of the
+order LIFECYCLE.
 
-Consumes ``alpaca:oms:commands`` (submit / cancel / algo_create / algo_cancel) and ``alpaca:trade_updates``
-(group ``oms``). Validates, dedupes on client_order_id (Redis), forwards execution to EMS
-(``alpaca:ems:requests``) and algos to the algo engine (``alpaca:algo:requests``), relays replies, keeps
-live order state in Redis hashes and emits snapshots to ``alpaca:oms:events``.
-Never calls Alpaca order endpoints; never touches SQLite. No I/O at import time.
+- Consumes alpaca:oms:commands (submit / cancel / algo_create / algo_cancel): validate, replay
+  check (cmd_id), dedupe (client_order_id), forward to crossing.py (alpaca:cross:requests) or the
+  algo engine (alpaca:algo:requests), relay the reply.
+- Consumes alpaca:trade_updates (exchange events, EMS execution reports, crossing internal_*
+  events) and keeps live order hashes in Redis.
+- Reconciles with Alpaca REST (read-only) periodically.
+
+Never calls Alpaca order endpoints, never touches SQLite. Durable history is written by
+persister.py from the events emitted on alpaca:oms:events.
 """
 from __future__ import annotations
 
@@ -20,30 +25,37 @@ import trader
 log = runtime.log("oms")
 
 COID_RE = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
-ALGO_COID_RE = re.compile(r"^algo-([A-Za-z0-9]+)-(\d+)$")
+ALGO_COID_RE = re.compile(r"^algo-([A-Za-z0-9]{1,12})-(\d+)$")
 KINDS = ("submit", "cancel", "algo_create", "algo_cancel")
-NUMERIC_FIELDS = ("qty", "limit_price", "filled_qty", "filled_avg_price")
 LAST_RECONCILE_KEY = "alpaca:oms:last_reconcile"
+NUMERIC_FIELDS = ("qty", "limit_price", "filled_qty", "filled_avg_price")
+
+_spill = runtime.SpillBuffer()
 
 
 # --------------------------------------------------------------------------- helpers
-def _float(x):
-    if x is None or x == "":
-        return None
+def _f(x, default=None):
+    if x is None or x == "" or x == "None":
+        return default
     try:
         return float(x)
     except (TypeError, ValueError):
+        return default
+
+
+def _s(x):
+    if x is None or x == "" or x == "None":
         return None
+    return str(x)
 
 
-def _empty(v) -> bool:
-    return v is None or (isinstance(v, str) and v.strip() in ("", "None", "null"))
-
-
-def _s(v):
-    if v is None:
+def _int(x):
+    if x is None or x == "" or x == "None":
         return None
-    return runtime._sval(v)
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return None
 
 
 def _derive_algo(coid):
@@ -52,143 +64,161 @@ def _derive_algo(coid):
     m = ALGO_COID_RE.match(str(coid))
     if not m:
         return None, None
-    return m.group(1), str(int(m.group(2)))
+    return m.group(1), int(m.group(2))
+
+
+def _convert(h: dict) -> dict:
+    """Redis hash (strings) -> dict with numerics as float/None."""
+    out = {}
+    for k, v in (h or {}).items():
+        if k in NUMERIC_FIELDS:
+            out[k] = _f(v)
+        elif k == "slice_idx":
+            out[k] = _int(v)
+        else:
+            out[k] = _s(v)
+    return out
+
+
+def changed(old: dict, merged: dict) -> bool:
+    old = old or {}
+    merged = merged or {}
+    if _s(old.get("status")) != _s(merged.get("status")):
+        return True
+    for k in ("filled_qty", "filled_avg_price", "limit_price"):
+        if _f(old.get(k)) != _f(merged.get(k)):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- live state
 def apply_order(r, order: dict, *, account, source=None, algo_id=None, slice_idx=None,
-                event_ts=None) -> dict:
-    new = runtime.normalize_order(order or {})
+                book=None, event_ts=None) -> dict:
+    order = order or {}
+    new = runtime.normalize_order(order)
     order_id = new.get("order_id")
     if not order_id:
-        return {}
-    key = runtime.order_key(order_id)
-    old = runtime.redis_call(r.hgetall, key) or {}
+        raise ValueError("order has no id")
+    okey = runtime.order_key(order_id)
+    old = runtime.redis_call(r.hgetall, okey) or {}
 
-    old_status = old.get("status") or None
+    old_status = _s(old.get("status"))
     new_status = new.get("status")
     if old_status in runtime.TERMINAL_STATUSES and new_status not in runtime.TERMINAL_STATUSES:
         status = old_status
     else:
         status = new_status or old_status
 
-    fq_old, fq_new = _float(old.get("filled_qty")), new.get("filled_qty")
-    vals = [x for x in (fq_old, fq_new) if x is not None]
-    filled_qty = max(vals) if vals else None
+    fq_old, fq_new = _f(old.get("filled_qty")), new.get("filled_qty")
+    if fq_old is None:
+        filled_qty = fq_new
+    elif fq_new is None:
+        filled_qty = fq_old
+    else:
+        filled_qty = max(fq_old, fq_new)
 
-    merged: dict = {}
+    merged = {k: (_s(v) if not isinstance(v, (int, float)) else v) for k, v in old.items()}
     for k, v in new.items():
-        merged[k] = _s(v) if v is not None else old.get(k)
+        if v is not None:
+            merged[k] = v
+    merged["order_id"] = order_id
     merged["status"] = status
-    merged["filled_qty"] = _s(filled_qty) if filled_qty is not None else old.get("filled_qty")
-    for k in ("filled_avg_price", "limit_price"):
-        merged[k] = _s(new.get(k)) if new.get(k) is not None else old.get(k)
+    merged["filled_qty"] = filled_qty
+    for k in ("filled_avg_price", "limit_price", "qty"):
+        merged[k] = new.get(k) if new.get(k) is not None else _f(old.get(k))
 
-    d_algo, d_idx = _derive_algo(merged.get("client_order_id"))
-    for k, given, derived in (("source", source, "algo" if d_algo else None),
-                              ("algo_id", algo_id, d_algo),
-                              ("slice_idx", slice_idx, d_idx)):
-        ov = old.get(k)
-        if not _empty(ov):
-            merged[k] = ov
-        elif not _empty(given):
-            merged[k] = _s(given)
-        elif derived is not None:
-            merged[k] = derived
-        else:
-            merged[k] = None
+    coid = new.get("client_order_id") or _s(old.get("client_order_id"))
+    d_algo, d_idx = _derive_algo(coid)
 
-    merged["account"] = "live" if account == "live" else "paper"
-    merged["last_event_ts"] = _s(event_ts) if event_ts else runtime.now_iso()
+    def keep(field, given, derived=None):
+        ov = _s(old.get(field))
+        if ov is not None:
+            return ov
+        if given not in (None, ""):
+            return given
+        ov2 = order.get(field)
+        if ov2 not in (None, ""):
+            return ov2
+        return derived
+
+    merged["source"] = keep("source", source)
+    merged["algo_id"] = keep("algo_id", algo_id, d_algo)
+    merged["slice_idx"] = keep("slice_idx", slice_idx, d_idx)
+    merged["book"] = keep("book", book, runtime.DEFAULT_BOOK)
+
+    venue = order.get("venue") or _s(old.get("venue"))
+    if not venue:
+        venue = "internal" if str(order_id).startswith("int-") else "alpaca"
+    merged["venue"] = venue
+    for extra in ("routed_order_id", "error"):
+        if order.get(extra) not in (None, ""):
+            merged[extra] = order.get(extra)
+    merged["account"] = account or _s(old.get("account")) or "paper"
+    merged["last_event_ts"] = event_ts or runtime.now_iso()
     merged["updated_at"] = runtime.now_iso()
-    merged["order_id"] = str(order_id)
-    merged = {k: v for k, v in merged.items() if v is not None}
 
     terminal = status in runtime.TERMINAL_STATUSES
-    runtime.redis_call(runtime.hset_state, r, key, merged,
-                       ttl=runtime.STATE_TTL_S if terminal else None)
-    coid = merged.get("client_order_id")
+    ttl = runtime.STATE_TTL_S if terminal else None
+    runtime.redis_call(runtime.hset_state, r, okey, merged, ttl=ttl)
+
     if coid:
-        if terminal:
-            runtime.redis_call(r.set, runtime.coid_key(coid), order_id, ex=runtime.STATE_TTL_S)
-        else:
-            runtime.redis_call(r.set, runtime.coid_key(coid), order_id)
+        ckey = runtime.coid_key(coid)
+        is_internal = str(order_id).startswith("int-")
+        write = True
+        if is_internal:
+            cur = runtime.redis_call(r.get, ckey)
+            if cur and not str(cur).startswith("int-") and cur != order_id:
+                write = False
+        if write:
+            if terminal:
+                runtime.redis_call(r.set, ckey, order_id, ex=runtime.STATE_TTL_S)
+            else:
+                runtime.redis_call(r.set, ckey, order_id)
     if terminal:
         runtime.redis_call(r.srem, runtime.SET_OPEN_ORDERS, order_id)
     else:
         runtime.redis_call(r.sadd, runtime.SET_OPEN_ORDERS, order_id)
-    return merged
 
-
-def changed(old: dict, merged: dict) -> bool:
-    old = old or {}
-    merged = merged or {}
-    if (old.get("status") or None) != (merged.get("status") or None):
-        return True
-    for k in ("filled_qty", "filled_avg_price", "limit_price"):
-        if _float(old.get(k)) != _float(merged.get(k)):
-            return True
-    return False
-
-
-def _order_view(h: dict | None) -> dict | None:
-    if not h:
-        return None
-    out = dict(h)
-    for k in NUMERIC_FIELDS:
-        out[k] = _float(h.get(k))
-    si = h.get("slice_idx")
-    if not _empty(si):
-        try:
-            out["slice_idx"] = int(float(si))
-        except (TypeError, ValueError):
-            pass
-    return out
+    return {k: runtime._sval(v) for k, v in merged.items() if v is not None}
 
 
 def emit_order(r, merged: dict) -> None:
-    try:
-        m = merged or {}
-        view = _order_view(m) or {}
-        runtime.publish(r, runtime.STREAM_OMS_EVENTS, {
-            "type": "order", "ts": runtime.now_iso(), "account": m.get("account"),
-            "source": m.get("source"), "algo_id": m.get("algo_id"),
-            "slice_idx": view.get("slice_idx"), "order": view,
-        })
-    except Exception as e:
-        log.error("emit_order failed: %s", e)
+    m = merged or {}
+    runtime.publish(r, runtime.STREAM_OMS_EVENTS, {
+        "type": "order", "ts": runtime.now_iso(), "account": m.get("account"),
+        "source": _s(m.get("source")), "algo_id": _s(m.get("algo_id")),
+        "slice_idx": _int(m.get("slice_idx")), "order": _convert(m),
+    }, buffer=_spill)
 
 
 def emit_command(r, record: dict) -> None:
-    try:
-        runtime.publish(r, runtime.STREAM_OMS_EVENTS,
-                        {"type": "command", "ts": runtime.now_iso(), "command": record})
-    except Exception as e:
-        log.error("emit_command failed: %s", e)
+    runtime.publish(r, runtime.STREAM_OMS_EVENTS,
+                    {"type": "command", "ts": runtime.now_iso(), "command": record}, buffer=_spill)
 
 
 def get_order_state(r, order_id=None, client_order_id=None) -> dict | None:
-    try:
-        if not order_id and client_order_id:
-            order_id = runtime.redis_call(r.get, runtime.coid_key(client_order_id))
-        if not order_id:
-            return None
-        h = runtime.redis_call(r.hgetall, runtime.order_key(order_id))
-        return _order_view(h) if h else None
-    except Exception as e:
-        log.warning("get_order_state failed: %s", e)
+    oid = order_id
+    if not oid and client_order_id:
+        oid = runtime.redis_call(r.get, runtime.coid_key(client_order_id))
+    if not oid:
         return None
+    h = runtime.redis_call(r.hgetall, runtime.order_key(oid)) or {}
+    if not h:
+        return None
+    d = _convert(h)
+    d.setdefault("order_id", str(oid))
+    return d
 
 
 # --------------------------------------------------------------------------- forwarding
-def forward_to_ems(r, payload: dict, timeout: float = 10.0) -> dict:
-    p = dict(payload)
+def forward_to_cross(r, payload: dict, timeout: float = 10.0) -> dict:
+    p = {k: v for k, v in dict(payload or {}).items() if v is not None}
     p["cmd_id"] = runtime.new_id()
-    return runtime.send_command(r, runtime.STREAM_EMS_REQUESTS, p, timeout)
+    return runtime.send_command(r, runtime.STREAM_CROSS_REQUESTS, p, timeout)
 
 
 def forward_to_algo(r, payload: dict, timeout: float = 10.0) -> dict:
-    p = dict(payload)
+    p = {k: v for k, v in dict(payload or {}).items() if v is not None}
     p["cmd_id"] = runtime.new_id()
     return runtime.send_command(r, runtime.STREAM_ALGO_REQUESTS, p, timeout)
 
@@ -201,357 +231,365 @@ def handle_payload(r, stream_id: str, payload: dict) -> dict | None:
         order = payload.get("order")
         if not isinstance(order, dict) or not (order.get("id") or order.get("order_id")):
             return None
-        merged = apply_order(r, order, account=payload.get("account", "paper"),
-                             source=payload.get("source"), algo_id=payload.get("algo_id"),
-                             slice_idx=payload.get("slice_idx"), event_ts=payload.get("ts"))
-        return merged or None
-    except Exception as e:
-        log.error("handle_payload %s failed: %s", stream_id, e)
+        return apply_order(r, order, account=payload.get("account") or "paper",
+                           source=payload.get("source"), algo_id=payload.get("algo_id"),
+                           slice_idx=payload.get("slice_idx"), book=payload.get("book"),
+                           event_ts=payload.get("ts"))
+    except Exception:
+        log.exception("handle_payload failed for %s", stream_id)
         return None
 
 
 # --------------------------------------------------------------------------- commands
-def _order_reply(ok, status, *, order_id=None, client_order_id=None, order=None, error=None) -> dict:
-    return {"ok": bool(ok), "status": status, "order_id": order_id, "client_order_id": client_order_id,
-            "order": order, "error": error}
-
-
-def _algo_reply(ok, status, *, algo_id=None, algo=None, error=None) -> dict:
-    return {"ok": bool(ok), "status": status, "algo_id": algo_id, "algo": algo, "error": error}
-
-
-def _cmd_submit(r, p: dict, account: str, ctx: dict) -> dict:
-    coid = p.get("client_order_id")
-    ctx["client_order_id"] = coid
-    side = str(p.get("side") or "").lower()
-    typ = str(p.get("type") or "").lower()
-    tif = str(p.get("tif") or p.get("time_in_force") or "gtc").lower()
-    qty = _float(p.get("qty"))
-    lp = _float(p.get("limit_price"))
-    symbol = p.get("symbol")
+def _submit(r, payload: dict, cmd_id: str, account: str) -> dict:
+    coid = payload.get("client_order_id")
+    base = {"cmd_id": cmd_id, "order_id": None, "client_order_id": coid, "order": None}
+    side = str(payload.get("side") or "").lower()
+    otype = str(payload.get("type") or "market").lower()
+    tif = str(payload.get("tif") or payload.get("time_in_force") or "gtc").lower()
+    qty = _f(payload.get("qty"))
+    lim = _f(payload.get("limit_price"))
+    symbol = payload.get("symbol")
     err = None
     if side not in ("buy", "sell"):
         err = "side must be buy or sell"
-    elif typ not in ("market", "limit"):
+    elif otype not in ("market", "limit"):
         err = "type must be market or limit"
     elif qty is None or qty <= 0:
         err = "qty must be > 0"
-    elif typ == "limit" and (lp is None or lp <= 0):
+    elif otype == "limit" and (lim is None or lim <= 0):
         err = "limit order requires limit_price > 0"
     elif tif not in ("gtc", "ioc"):
         err = "tif must be gtc or ioc"
     elif not isinstance(coid, str) or not COID_RE.match(coid):
         err = "client_order_id must match ^[A-Za-z0-9_-]{1,48}$"
-    elif not symbol:
+    elif not symbol or not isinstance(symbol, str):
         err = "symbol required"
     if err:
-        return _order_reply(False, "rejected", client_order_id=coid, error=err)
+        return {**base, "ok": False, "status": "rejected", "error": err}
+    if otype == "market":
+        lim = None
+    book = payload.get("book") or runtime.DEFAULT_BOOK
+    source = payload.get("source")
+    algo_id = payload.get("algo_id")
+    slice_idx = payload.get("slice_idx")
 
-    existing_id = runtime.redis_call(r.get, runtime.coid_key(coid))
-    if existing_id:
-        h = runtime.redis_call(r.hgetall, runtime.order_key(existing_id))
-        if h:
-            ctx["order_id"] = existing_id
-            return _order_reply(True, "already_submitted", order_id=existing_id, client_order_id=coid,
-                                order=_order_view(h))
+    existing = get_order_state(r, client_order_id=coid)
+    if existing:
+        return {**base, "ok": True, "status": "already_submitted",
+                "order_id": existing.get("order_id"), "order": existing, "error": None}
 
-    if runtime.worker_alive(r, "ems") is None:
-        return _order_reply(False, "error", client_order_id=coid, error="EMS not running")
+    if runtime.worker_alive(r, "crossing") is None:
+        return {**base, "ok": False, "status": "error", "error": "crossing not running"}
 
-    source, algo_id, slice_idx = p.get("source"), p.get("algo_id"), p.get("slice_idx")
-    req = {"kind": "submit", "account": account, "client_order_id": coid, "symbol": str(symbol),
-           "side": side, "type": typ, "qty": qty, "limit_price": lp if typ == "limit" else None,
-           "tif": tif, "source": source, "algo_id": algo_id, "slice_idx": slice_idx}
-    rep = forward_to_ems(r, req) or {}
+    fwd = {"kind": "submit", "account": account, "client_order_id": coid, "symbol": symbol,
+           "side": side, "type": otype, "qty": qty, "limit_price": lim, "tif": tif,
+           "source": source, "book": book, "cross": payload.get("cross"),
+           "hold_s": payload.get("hold_s"), "algo_id": algo_id, "slice_idx": slice_idx}
+    rep = forward_to_cross(r, {k: v for k, v in fwd.items() if v is not None})
+    rep = rep if isinstance(rep, dict) else {"ok": False, "status": "unknown", "error": "bad reply"}
     st = rep.get("status")
+    extras = {k: rep.get(k) for k in ("venue", "crossed_qty", "remaining", "crosses",
+                                       "routed_order_id") if k in rep}
     if st in ("acked", "already_submitted"):
-        order = rep.get("order")
+        order_out = rep.get("order")
         oid = rep.get("order_id")
-        view = None
-        if isinstance(order, dict) and (order.get("id") or order.get("order_id")):
-            merged = apply_order(r, order, account=account, source=source, algo_id=algo_id,
-                                 slice_idx=slice_idx)
-            if merged:
-                emit_order(r, merged)
-                view = _order_view(merged)
-                oid = merged.get("order_id") or oid
-        ctx["order_id"] = oid
-        return _order_reply(True, st, order_id=oid, client_order_id=rep.get("client_order_id") or coid,
-                            order=view or order)
+        if isinstance(order_out, dict) and (order_out.get("id") or order_out.get("order_id")):
+            merged = apply_order(r, order_out, account=account, source=source, algo_id=algo_id,
+                                 slice_idx=slice_idx, book=book)
+            emit_order(r, merged)
+            order_out = _convert(merged)
+            oid = order_out.get("order_id") or oid
+        return {**base, **extras, "ok": bool(rep.get("ok", True)), "status": st,
+                "order_id": oid, "order": order_out, "error": rep.get("error")}
     if st == "timeout":
-        return _order_reply(False, "unknown", client_order_id=coid, error="EMS did not reply")
-    if st == "unknown":
-        return _order_reply(False, "unknown", client_order_id=coid, error=rep.get("error"))
+        return {**base, "ok": False, "status": "unknown", "error": "crossing did not reply"}
     if st in ("rejected", "error"):
-        return _order_reply(False, st, client_order_id=coid, error=rep.get("error"))
-    return _order_reply(bool(rep.get("ok")), st or "error", order_id=rep.get("order_id"),
-                        client_order_id=coid, order=rep.get("order"),
-                        error=rep.get("error") or (None if rep.get("ok") else "unexpected EMS reply"))
+        return {**base, **extras, "ok": False, "status": st, "order_id": rep.get("order_id"),
+                "order": rep.get("order"), "error": rep.get("error") or st}
+    return {**base, **extras, "ok": False, "status": "unknown", "order_id": rep.get("order_id"),
+            "order": rep.get("order"), "error": rep.get("error") or f"crossing status {st}"}
 
 
-def _cmd_cancel(r, p: dict, account: str, ctx: dict) -> dict:
-    order_id = p.get("order_id") or None
-    coid = p.get("client_order_id") or None
-    state = get_order_state(r, order_id=order_id, client_order_id=coid)
+def _cancel(r, payload: dict, cmd_id: str, account: str) -> dict:
+    order_id = _s(payload.get("order_id"))
+    coid = _s(payload.get("client_order_id"))
+    state = None
+    if coid:
+        state = get_order_state(r, client_order_id=coid)
+    if state is None and order_id:
+        state = get_order_state(r, order_id=order_id)
     if state:
-        order_id = state.get("order_id") or order_id
-        coid = state.get("client_order_id") or coid
-    ctx["order_id"], ctx["client_order_id"] = order_id, coid
-    if not order_id:
-        return _order_reply(False, "not_found", client_order_id=coid, error="order not found")
-    if runtime.worker_alive(r, "ems") is None:
-        return _order_reply(False, "error", order_id=order_id, client_order_id=coid,
-                            error="EMS not running")
-    rep = forward_to_ems(r, {"kind": "cancel_order", "account": account, "order_id": str(order_id),
-                             "client_order_id": coid, "source": p.get("source")}) or {}
+        coid = coid or state.get("client_order_id")
+        order_id = order_id or state.get("order_id")
+    base = {"cmd_id": cmd_id, "order_id": order_id, "client_order_id": coid, "order": state}
+    if not state and not order_id and not coid:
+        return {**base, "ok": False, "status": "not_found", "error": "order_id or client_order_id required"}
+    if runtime.worker_alive(r, "crossing") is None:
+        return {**base, "ok": False, "status": "error", "error": "crossing not running"}
+    fwd = {"kind": "cancel_order", "account": (state or {}).get("account") or account,
+           "order_id": order_id, "client_order_id": coid, "source": payload.get("source")}
+    rep = forward_to_cross(r, fwd)
+    rep = rep if isinstance(rep, dict) else {"ok": False, "status": "error", "error": "bad reply"}
     st = rep.get("status")
+    if st == "timeout":
+        return {**base, "ok": False, "status": "unknown", "error": "crossing did not reply"}
+    out = {**base, "ok": bool(rep.get("ok")), "status": st,
+           "order_id": rep.get("order_id") or order_id,
+           "client_order_id": rep.get("client_order_id") or coid, "error": rep.get("error")}
     if st == "cancel_requested":
-        cur = runtime.redis_call(r.hgetall, runtime.order_key(order_id)) or {}
-        view = None
-        if cur:
-            if cur.get("status") not in runtime.TERMINAL_STATUSES:
-                upd = {"status": "pending_cancel", "updated_at": runtime.now_iso()}
-                runtime.redis_call(runtime.hset_state, r, runtime.order_key(order_id), upd)
-                cur.update(upd)
-                emit_order(r, cur)
-            view = _order_view(cur)
-        return _order_reply(True, "cancel_requested", order_id=str(order_id), client_order_id=coid,
-                            order=view)
-    if st == "timeout":
-        return _order_reply(False, "timeout", order_id=order_id, client_order_id=coid,
-                            error="EMS did not reply")
-    return _order_reply(bool(rep.get("ok")), st or "error", order_id=rep.get("order_id") or order_id,
-                        client_order_id=coid, error=rep.get("error"))
+        targets = []
+        for oid in (out["order_id"], order_id, (state or {}).get("order_id")):
+            if oid and oid not in targets:
+                targets.append(oid)
+        for oid in targets:
+            try:
+                okey = runtime.order_key(oid)
+                h = runtime.redis_call(r.hgetall, okey) or {}
+                if h and h.get("status") not in runtime.TERMINAL_STATUSES:
+                    runtime.redis_call(r.hset, okey, mapping={"status": "pending_cancel",
+                                                              "updated_at": runtime.now_iso()})
+                    h["status"] = "pending_cancel"
+                    emit_order(r, h)
+                    out["order"] = _convert(h)
+            except Exception:
+                log.exception("pending_cancel update failed for %s", oid)
+    return out
 
 
-def _relay_algo(rep: dict, ctx: dict, fallback_algo_id=None) -> dict:
-    rep = rep or {}
-    st = rep.get("status")
-    algo_id = rep.get("algo_id") or fallback_algo_id
-    ctx["algo_id"] = algo_id
-    if st == "timeout":
-        return _algo_reply(False, "timeout", algo_id=algo_id, error="algo_engine did not reply")
-    return _algo_reply(bool(rep.get("ok")), st or "error", algo_id=algo_id, algo=rep.get("algo"),
-                       error=rep.get("error"))
+def _algo_reply(rep: dict, cmd_id: str, algo_id=None, timeout_err="algo_engine did not reply") -> dict:
+    rep = rep if isinstance(rep, dict) else {"ok": False, "status": "error", "error": "bad reply"}
+    if rep.get("status") == "timeout":
+        return {"ok": False, "status": "unknown", "cmd_id": cmd_id, "algo_id": algo_id,
+                "algo": None, "error": timeout_err}
+    return {"ok": bool(rep.get("ok")), "status": rep.get("status"), "cmd_id": cmd_id,
+            "algo_id": rep.get("algo_id") or algo_id, "algo": rep.get("algo"),
+            "error": rep.get("error")}
 
 
-def _cmd_algo_create(r, p: dict, account: str, ctx: dict) -> dict:
-    strategy = p.get("strategy")
-    side = str(p.get("side") or "").lower()
-    total_qty = _float(p.get("total_qty"))
+def _algo_create(r, payload: dict, cmd_id: str, account: str) -> dict:
+    base = {"cmd_id": cmd_id, "algo_id": None, "algo": None}
+    strategy = payload.get("strategy")
+    side = str(payload.get("side") or "").lower()
+    total = _f(payload.get("total_qty"))
     if not isinstance(strategy, str) or not strategy:
-        return _algo_reply(False, "rejected", error="strategy required")
+        return {**base, "ok": False, "status": "rejected", "error": "strategy required"}
     if side not in ("buy", "sell"):
-        return _algo_reply(False, "rejected", error="side must be buy or sell")
-    if total_qty is None or total_qty <= 0:
-        return _algo_reply(False, "rejected", error="total_qty must be > 0")
-    if not p.get("symbol"):
-        return _algo_reply(False, "rejected", error="symbol required")
+        return {**base, "ok": False, "status": "rejected", "error": "side must be buy or sell"}
+    if total is None or total <= 0:
+        return {**base, "ok": False, "status": "rejected", "error": "total_qty must be > 0"}
     if runtime.worker_alive(r, "algo_engine") is None:
-        return _algo_reply(False, "error", error="algo_engine not running")
-    req = {"kind": "create", "strategy": strategy, "account": account, "symbol": p.get("symbol"),
-           "side": side, "total_qty": total_qty, "duration_s": p.get("duration_s"),
-           "n_slices": p.get("n_slices"), "limit_cap": p.get("limit_cap"),
-           "params": p.get("params") or {}, "source": p.get("source")}
-    return _relay_algo(forward_to_algo(r, req), ctx)
+        return {**base, "ok": False, "status": "error", "error": "algo_engine not running"}
+    fwd = {"kind": "create", "strategy": strategy, "account": account,
+           "book": payload.get("book") or runtime.DEFAULT_BOOK,
+           "symbol": payload.get("symbol"), "side": side, "total_qty": total,
+           "duration_s": payload.get("duration_s"), "n_slices": payload.get("n_slices"),
+           "limit_cap": payload.get("limit_cap"), "params": payload.get("params"),
+           "source": payload.get("source")}
+    return _algo_reply(forward_to_algo(r, fwd), cmd_id)
 
 
-def _cmd_algo_cancel(r, p: dict, account: str, ctx: dict) -> dict:
-    algo_id = p.get("algo_id")
-    ctx["algo_id"] = algo_id
+def _algo_cancel(r, payload: dict, cmd_id: str) -> dict:
+    algo_id = payload.get("algo_id")
     if not algo_id:
-        return _algo_reply(False, "rejected", error="algo_id required")
+        return {"ok": False, "status": "rejected", "cmd_id": cmd_id, "algo_id": None,
+                "algo": None, "error": "algo_id required"}
     if runtime.worker_alive(r, "algo_engine") is None:
-        return _algo_reply(False, "error", algo_id=algo_id, error="algo_engine not running")
-    rep = forward_to_algo(r, {"kind": "cancel", "algo_id": algo_id, "source": p.get("source")})
-    return _relay_algo(rep, ctx, fallback_algo_id=algo_id)
+        return {"ok": False, "status": "error", "cmd_id": cmd_id, "algo_id": algo_id,
+                "algo": None, "error": "algo_engine not running"}
+    fwd = {"kind": "cancel", "algo_id": algo_id, "source": payload.get("source")}
+    return _algo_reply(forward_to_algo(r, fwd), cmd_id, algo_id)
 
 
 def handle_command(r, payload: dict, stream_id: str | None = None) -> dict:
     payload = payload if isinstance(payload, dict) else {}
-    cmd_id = str(payload.get("cmd_id") or payload.get("req_id") or runtime.new_id())
-
+    cmd_id = payload.get("cmd_id") or payload.get("req_id") or runtime.new_id()
     try:
         stored = runtime.redis_call(r.get, runtime.cmd_key(cmd_id))
-    except Exception as e:
-        log.warning("cmd replay lookup failed: %s", e)
+    except Exception:
+        log.exception("replay lookup failed for %s", cmd_id)
         stored = None
     if stored:
         try:
-            reply = json.loads(stored)
-            if isinstance(reply, dict):
-                reply["cmd_id"] = cmd_id
-                runtime.redis_call(runtime.send_reply, r, cmd_id, reply)
-                log.info("cmd %s replayed -> %s", cmd_id, reply.get("status"))
-                return reply
-        except Exception as e:
-            log.warning("stored reply for %s unusable: %s", cmd_id, e)
+            rep = json.loads(stored)
+            if isinstance(rep, dict):
+                runtime.send_reply(r, cmd_id, rep)
+                log.info("REPLAY cmd_id=%s status=%s", cmd_id, rep.get("status"))
+                return rep
+        except (ValueError, TypeError):
+            pass
 
     received_at = runtime.now_iso()
     kind = payload.get("kind")
-    raw_account = payload.get("account")
-    account = "paper" if raw_account in (None, "") else str(raw_account).lower()
-    ctx = {"order_id": payload.get("order_id"), "client_order_id": payload.get("client_order_id"),
-           "algo_id": payload.get("algo_id"), "slice_idx": payload.get("slice_idx")}
-    reply = None
+    account = str(payload.get("account") or "paper").lower()
+    reply: dict
     try:
         if kind not in KINDS:
-            reply = {"ok": False, "status": "error", "error": f"unknown kind {kind!r}"}
+            reply = {"ok": False, "status": "error", "cmd_id": cmd_id,
+                     "error": f"unknown kind {kind!r}"}
         elif account not in ("paper", "live"):
-            reply = {"ok": False, "status": "rejected", "error": "account must be paper or live"}
+            reply = {"ok": False, "status": "rejected", "cmd_id": cmd_id,
+                     "error": "account must be paper or live"}
         elif kind == "submit":
-            reply = _cmd_submit(r, payload, account, ctx)
+            reply = _submit(r, payload, cmd_id, account)
         elif kind == "cancel":
-            reply = _cmd_cancel(r, payload, account, ctx)
+            reply = _cancel(r, payload, cmd_id, account)
         elif kind == "algo_create":
-            reply = _cmd_algo_create(r, payload, account, ctx)
+            reply = _algo_create(r, payload, cmd_id, account)
         else:
-            reply = _cmd_algo_cancel(r, payload, account, ctx)
+            reply = _algo_cancel(r, payload, cmd_id)
     except Exception as e:
         log.exception("command %s (%s) failed", cmd_id, kind)
-        reply = {"ok": False, "status": "error", "error": f"{type(e).__name__}: {e}"}
-    if not isinstance(reply, dict):
-        reply = {"ok": False, "status": "error", "error": "no reply"}
+        reply = {"ok": False, "status": "error", "cmd_id": cmd_id,
+                 "error": f"{type(e).__name__}: {e}"}
     reply["cmd_id"] = cmd_id
-    if kind in ("algo_create", "algo_cancel"):
-        reply.setdefault("algo_id", ctx.get("algo_id"))
-        reply.setdefault("algo", None)
-    else:
-        reply.setdefault("order_id", ctx.get("order_id"))
-        reply.setdefault("client_order_id", ctx.get("client_order_id"))
-        reply.setdefault("order", None)
-    reply.setdefault("error", None)
 
     record = {
         "cmd_id": cmd_id, "kind": kind, "account": account,
-        "client_order_id": reply.get("client_order_id") or ctx.get("client_order_id"),
-        "order_id": reply.get("order_id") or ctx.get("order_id"),
-        "algo_id": reply.get("algo_id") or ctx.get("algo_id"),
-        "slice_idx": ctx.get("slice_idx"), "source": payload.get("source"),
+        "client_order_id": reply.get("client_order_id") or payload.get("client_order_id"),
+        "order_id": reply.get("order_id") or payload.get("order_id"),
+        "algo_id": reply.get("algo_id") or payload.get("algo_id"),
+        "slice_idx": payload.get("slice_idx"), "source": payload.get("source"),
         "payload": payload, "status": reply.get("status"), "error": reply.get("error"),
         "received_at": received_at, "completed_at": runtime.now_iso(),
     }
-    emit_command(r, record)
+    try:
+        emit_command(r, record)
+    except Exception:
+        log.exception("emit_command failed for %s", cmd_id)
     try:
         runtime.redis_call(r.set, runtime.cmd_key(cmd_id), json.dumps(reply, default=str),
                            ex=runtime.STATE_TTL_S)
-    except Exception as e:
-        log.error("storing cmd %s failed: %s", cmd_id, e)
+    except Exception:
+        log.exception("storing reply failed for %s", cmd_id)
     try:
         runtime.redis_call(runtime.send_reply, r, cmd_id, reply)
-    except Exception as e:
-        log.error("send_reply %s failed: %s", cmd_id, e)
-    log.info("cmd %s kind=%s source=%s coid=%s -> %s%s", cmd_id, kind, payload.get("source"),
-             record["client_order_id"], reply.get("status"),
-             f" ({reply.get('error')})" if reply.get("error") else "")
+    except Exception:
+        log.exception("send_reply failed for %s", cmd_id)
+    log.info("CMD %s kind=%s source=%s status=%s coid=%s order_id=%s algo_id=%s err=%s",
+             cmd_id, kind, payload.get("source"), reply.get("status"),
+             record["client_order_id"], record["order_id"], record["algo_id"], reply.get("error"))
     return reply
 
 
-# --------------------------------------------------------------------------- reconciliation
+# --------------------------------------------------------------------------- reconcile
+def _reconcile_accounts():
+    accts = ["paper"]
+    if str(os.environ.get("OMS_RECONCILE_LIVE", "0")).strip() == "1":
+        accts.append("live")
+    return tuple(accts)
+
+
 def reconcile(r, accounts=("paper",), since_iso=None) -> int:
-    since = since_iso or (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     count = 0
     try:
-        for account in accounts:
-            live = account == "live"
-            orders = list(trader.open_orders(live=live) or [])
-            orders += list(trader.list_orders("closed", after=since, live=live) or [])
+        for acct in accounts:
+            live = acct == "live"
+            after = since_iso or (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            orders = list(trader.open_orders(live) or [])
+            orders += list(trader.list_orders("closed", after=after, live=live) or [])
             for o in orders:
-                if not isinstance(o, dict):
-                    continue
-                oid = o.get("id") or o.get("order_id")
-                if not oid:
-                    continue
-                old = runtime.redis_call(r.hgetall, runtime.order_key(oid)) or {}
-                merged = apply_order(r, o, account=account)
-                if merged and (not old or changed(old, merged)):
-                    emit_order(r, merged)
-                    count += 1
+                try:
+                    if not isinstance(o, dict):
+                        continue
+                    oid = o.get("id") or o.get("order_id")
+                    if not oid:
+                        continue
+                    old = runtime.redis_call(r.hgetall, runtime.order_key(oid)) or {}
+                    merged = apply_order(r, o, account=acct)
+                    if not old or changed(old, merged):
+                        emit_order(r, merged)
+                        count += 1
+                except Exception:
+                    log.exception("reconcile of order failed")
         runtime.redis_call(r.set, LAST_RECONCILE_KEY, runtime.now_iso())
         if count:
-            log.info("reconcile updated %d orders", count)
+            log.info("RECONCILE updated %d order(s)", count)
         return count
     except Exception as e:
         log.warning("reconcile failed: %s: %s", type(e).__name__, e)
         return 0
 
 
-def _reconcile_accounts():
-    accts = ["paper"]
-    if os.environ.get("OMS_RECONCILE_LIVE") == "1":
-        accts.append("live")
-    return tuple(accts)
-
-
 # --------------------------------------------------------------------------- loops
+def _parse_entry(fields: dict) -> dict:
+    raw = (fields or {}).get("json")
+    if raw is None:
+        return dict(fields or {})
+    d = json.loads(raw)
+    if not isinstance(d, dict):
+        raise ValueError("payload is not an object")
+    return d
+
+
 def process_updates(r, reader) -> int:
     entries = reader.read()
-    n = 0
-    for entry_id, fields in entries:
+    for eid, fields in entries:
         try:
-            payload = json.loads(fields.get("json") or "{}")
-            if isinstance(payload, dict):
-                handle_payload(r, entry_id, payload)
-            reader.ack(entry_id)
+            payload = _parse_entry(fields)
+            handle_payload(r, eid, payload)
+            reader.ack(eid)
         except Exception as e:
-            log.exception("trade update %s failed", entry_id)
+            log.exception("update %s failed", eid)
             try:
-                reader.dead_letter(entry_id, fields, f"{type(e).__name__}: {e}")
-            except Exception as e2:
-                log.error("dead_letter %s failed: %s", entry_id, e2)
-        n += 1
-    return n
+                reader.dead_letter(eid, fields, f"{type(e).__name__}: {e}")
+            except Exception:
+                log.exception("dead_letter failed for %s", eid)
+    return len(entries)
 
 
 def process_commands(r, reader) -> int:
     entries = reader.read()
-    n = 0
-    for entry_id, fields in entries:
+    for eid, fields in entries:
         payload = None
         try:
-            payload = json.loads(fields.get("json") or "{}")
-            if not isinstance(payload, dict):
-                raise ValueError("payload is not an object")
-            handle_command(r, payload, entry_id)
-            reader.ack(entry_id)
+            payload = _parse_entry(fields)
+            handle_command(r, payload, eid)
+            reader.ack(eid)
         except Exception as e:
-            log.exception("command entry %s failed", entry_id)
+            log.exception("command entry %s failed", eid)
             try:
-                reader.dead_letter(entry_id, fields, f"{type(e).__name__}: {e}")
-            except Exception as e2:
-                log.error("dead_letter %s failed: %s", entry_id, e2)
-            cmd_id = payload.get("cmd_id") if isinstance(payload, dict) else None
+                reader.dead_letter(eid, fields, f"{type(e).__name__}: {e}")
+            except Exception:
+                log.exception("dead_letter failed for %s", eid)
+            cmd_id = (payload or {}).get("cmd_id") if isinstance(payload, dict) else None
             if cmd_id:
                 try:
                     runtime.send_reply(r, cmd_id, {"ok": False, "status": "error", "cmd_id": cmd_id,
                                                    "error": f"{type(e).__name__}: {e}"})
                 except Exception:
                     pass
-        n += 1
-    return n
+    return len(entries)
 
 
-def body():
+def _reconcile_interval() -> float:
+    try:
+        return float(os.environ.get("OMS_RECONCILE_S", "30"))
+    except ValueError:
+        return 30.0
+
+
+def body() -> None:
     r = runtime.get_redis()
     consumer = os.environ.get("OMS_CONSUMER", "oms-1")
-    interval = float(os.environ.get("OMS_RECONCILE_S", "30") or 30)
     cmd_reader = runtime.GroupReader(r, runtime.STREAM_OMS_COMMANDS, "oms", consumer, block_ms=500)
     upd_reader = runtime.GroupReader(r, runtime.STREAM_TRADE_UPDATES, "oms", consumer, block_ms=500)
-    log.info("oms started consumer=%s reconcile_every=%ss", consumer, interval)
+    interval = _reconcile_interval()
     accounts = _reconcile_accounts()
+    log.info("oms started consumer=%s reconcile_s=%s accounts=%s", consumer, interval, accounts)
     reconcile(r, accounts)
     last = time.monotonic()
     while True:
-        nc = process_commands(r, cmd_reader)
-        nu = process_updates(r, upd_reader)
+        n_cmd = process_commands(r, cmd_reader)
+        n_upd = process_updates(r, upd_reader)
         if time.monotonic() - last >= interval:
-            reconcile(r, accounts)
             last = time.monotonic()
-        if not nc and not nu:
+            reconcile(r, accounts)
+        if not n_cmd and not n_upd:
             time.sleep(0.05)
 
 
-def main():
+def main() -> None:
     runtime.run_forever(body, "oms")
 
 

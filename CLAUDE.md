@@ -36,7 +36,7 @@ Costs: Opus 5.5, ≤$6 per agent call by default (`--budget`), ~12 stages per fu
 Logs: `.codegen_logs/run-*.jsonl`; last-good backups `.codegen_backup/`; failed attempts `.codegen_failed/`.
 
 Runtime (paper by default): `cp run.bash.example run.bash`, fill keys, `source run.bash`,
-start Redis, `scripts/run_all.sh` (6 processes: subscriber, trade_stream, oms_ems, algo_engine, persister, webgui;
+start Redis, `scripts/run_all.sh` (7 processes: subscriber, trade_stream, oms_ems, crossing, algo_engine, persister, webgui;
 UI on http://127.0.0.1:5000). `cd generated && python cli.py health|symbols|buy|twap ...`.
 Only one TradingStream per Alpaca account: do not run `../TradingWithAlpaca` workers concurrently.
 
@@ -48,14 +48,24 @@ Only one TradingStream per Alpaca account: do not run `../TradingWithAlpaca` wor
   feed `orders, fills, trade_events, commands, algo_orders, algo_slices` with batched, idempotent
   upserts. It owns the schema (`persister.SCHEMA/setup_db`). webgui and cli read SQLite read-only
   for history and Redis for live state.
-- **OMS → EMS → exchange.** OMS (`oms.py`) is the front door and owns the order *lifecycle*:
+- **OMS → crossing → EMS → exchange.** OMS (`oms.py`) is the front door and owns the order *lifecycle*:
   every intent (`submit`, `cancel`, `algo_create`, `algo_cancel`) arrives on `alpaca:oms:commands` and
   is answered on `alpaca:reply:<cmd_id>` (`runtime.send_command`). OMS validates, replays by `cmd_id`
-  (`alpaca:cmd:<id>`), dedupes by `client_order_id` (`alpaca:coid:<id>`), forwards execution to EMS on
-  `alpaca:ems:requests` or algos to the algo engine on `alpaca:algo:requests`, relays the reply, and
+  (`alpaca:cmd:<id>`), dedupes by `client_order_id` (`alpaca:coid:<id>`), forwards execution to the liquidity book on
+  `alpaca:cross:requests` or algos to the algo engine on `alpaca:algo:requests`, relays the reply, and
   maintains the live order hashes `alpaca:order:<id>` + `alpaca:orders:open` from EMS replies,
   `alpaca:trade_updates` and REST reconciliation (every 30 s). It emits order/command snapshots to
   `alpaca:oms:events` for the persister. OMS makes no Alpaca order calls.
+- **Crossing / central liquidity book** (`crossing.py`) nets offsetting internal interest before
+  anything is routed: every intent carries a `book` (portfolio id); opposite-side orders on the same
+  symbol and account whose prices cross are matched internally at the midpoint (both legs avoid the
+  exchange fee and half the spread). Limit orders rest for `CROSS_HOLD_S` (default 1 s, per-order
+  `hold_s`) waiting for a counterparty; market/IOC/hold-0 orders cross what they can and route at once.
+  Each intent gets an internal record `int-<client_order_id>` (venue `internal`) with events
+  `internal_accepted/internal_fill/internal_routed/internal_canceled/internal_rejected` on
+  `alpaca:trade_updates`; the residual is routed to EMS with the SAME client_order_id, so one intent
+  can have two order records. Resting book in `alpaca:book:*`; savings tally in `alpaca:cross:stats`
+  (`FEE_BPS`, default 25). crossing.py is the only writer of `alpaca:ems:requests`.
 - **EMS** (`ems.py`) is the exchange gateway and the only caller of Alpaca order endpoints
   (`execute_submit` / `execute_cancel` via trader.py). After every submit or cancel it publishes an
   execution report (`ems_submitted` / `ems_cancel_requested`) onto `alpaca:trade_updates`. No algos.

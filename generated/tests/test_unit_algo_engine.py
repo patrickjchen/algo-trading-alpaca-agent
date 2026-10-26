@@ -120,6 +120,43 @@ def test_fill_tracked(fake_redis, capture):
     assert float(h["avg_px"]) == pytest.approx(100.5)
 
 
+def test_child_state_internal_plus_exchange(fake_redis):
+    coid = "algo-aaaabbbbcccc-000"
+    iid = runtime.internal_order_id(coid)
+    fake_redis.hset(runtime.order_key(iid), mapping={"order_id": iid, "status": "replaced",
+                                                     "filled_qty": "0.4", "filled_avg_price": "100"})
+    fake_redis.hset(runtime.order_key("ex1"), mapping={"order_id": "ex1", "status": "filled",
+                                                       "filled_qty": "0.6", "filled_avg_price": "102"})
+    fake_redis.set(runtime.coid_key(coid), "ex1")
+    cs = algo_engine.child_state(fake_redis, coid)
+    assert cs["filled_qty"] == pytest.approx(1.0)
+    assert cs["filled_avg_price"] == pytest.approx(101.2)
+    assert cs["status"] == "filled" and cs["order_id"] == "ex1"
+
+
+def test_child_state_internal_only_replaced_is_active(fake_redis):
+    coid = "algo-aaaabbbbcccc-001"
+    iid = runtime.internal_order_id(coid)
+    fake_redis.hset(runtime.order_key(iid), mapping={"order_id": iid, "status": "replaced",
+                                                     "filled_qty": "0"})
+    fake_redis.set(runtime.coid_key(coid), iid)
+    cs = algo_engine.child_state(fake_redis, coid)
+    assert cs["status"] in runtime.ACTIVE_STATUSES
+    assert algo_engine.child_state(fake_redis, "algo-none-000") is None
+
+
+def test_child_submit_carries_book(fake_redis, capture):
+    sent, _ = capture
+    aid = _create(fake_redis, book="A")["algo_id"]
+    algo_engine.tick(fake_redis, now_ts=_start(fake_redis, aid) + 0.5)
+    assert _submits(sent)[0]["book"] == "A"
+    sent.clear()
+    aid2 = _create(fake_redis)["algo_id"]
+    algo_engine.tick(fake_redis, now_ts=_start(fake_redis, aid2) + 0.5)
+    subs = _submits(sent)
+    assert subs and all(p["book"] == runtime.DEFAULT_BOOK for p in subs)
+
+
 def test_roll_forward(fake_redis, capture):
     sent, _ = capture
     aid = _create(fake_redis)["algo_id"]

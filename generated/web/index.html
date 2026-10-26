@@ -79,6 +79,12 @@
   .toast.err { background: #5a1f1a; border: 1px solid var(--red); }
   .note { color: var(--muted); font-style: italic; margin: 6px 0; }
   .scroll { max-height: 45vh; overflow: auto; }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 11px; }
+  .badge.internal { background: rgba(155,89,182,0.25); color: #c39bd3; }
+  .badge.alpaca { background: rgba(74,163,255,0.2); color: var(--blue); }
+  .ibook { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; }
+  .ibook > div { min-width: 260px; }
+  .ibook table td, .ibook table th { padding: 2px 6px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -102,6 +108,11 @@
   <div class="ladder" id="ladder"></div>
   <div class="meta" id="ladder-meta">waiting for orderbook...</div>
   <div class="note">Click an ask row to BUY at that price, a bid row to SELL.</div>
+  <h3>Internal book</h3>
+  <div class="ibook">
+    <div><div class="muted">resting internal bids</div><div id="ibook-bids" class="muted">no resting interest</div></div>
+    <div><div class="muted">resting internal asks</div><div id="ibook-asks" class="muted">no resting interest</div></div>
+  </div>
 </section>
 
 <section id="tab-activity" class="tab">
@@ -113,13 +124,16 @@
     <label class="muted">Account
       <select id="act-account"><option value="paper">paper</option><option value="live">live</option></select>
     </label>
+    <label class="muted">Venue
+      <select id="act-venue"><option value="all">all</option><option value="alpaca">alpaca</option><option value="internal">internal</option></select>
+    </label>
     <span class="muted" id="act-msg"></span>
   </div>
   <h3>Orders</h3>
   <div class="scroll">
   <table id="orders-table">
     <thead><tr>
-      <th>submitted_at</th><th>order_id</th><th>account</th><th>symbol</th><th>side</th><th>type</th>
+      <th>submitted_at</th><th>order_id</th><th>account</th><th>book</th><th>venue</th><th>symbol</th><th>side</th><th>type</th>
       <th class="num">Limit ($)</th><th class="num">qty</th><th class="num">filled_qty</th><th class="num">Avg Px ($)</th>
       <th class="num">Notional ($)</th><th>status</th><th>source</th><th>algo</th><th>action</th>
     </tr></thead>
@@ -130,7 +144,7 @@
   <div class="scroll">
   <table id="fills-table">
     <thead><tr>
-      <th>ts</th><th>order_id</th><th>symbol</th><th>side</th><th class="num">qty</th><th class="num">Price ($)</th>
+      <th>ts</th><th>order_id</th><th>venue</th><th>book</th><th>symbol</th><th>side</th><th class="num">qty</th><th class="num">Price ($)</th>
       <th class="num">Notional ($)</th><th>event</th><th>algo</th>
     </tr></thead>
     <tbody></tbody>
@@ -159,6 +173,13 @@
     <thead><tr><th>symbol</th><th class="num">realized_pnl ($)</th></tr></thead>
     <tbody></tbody>
   </table>
+  <h3>Internal crossing</h3>
+  <div class="grid" id="cross-grid"></div>
+  <h3>Positions by book</h3>
+  <table id="book-pos-table">
+    <thead><tr><th>book</th><th>symbol</th><th class="num">net qty</th><th class="num">bought</th><th class="num">sold</th></tr></thead>
+    <tbody></tbody>
+  </table>
 </section>
 
 <section id="tab-algos" class="tab">
@@ -171,6 +192,7 @@
     <label>Duration (s) <input type="number" id="algo-duration" step="1" min="1" value="300"></label>
     <label>Slices <input type="number" id="algo-slices" step="1" min="1" value="5"></label>
     <label>Limit cap (optional) <input type="number" id="algo-cap" step="any" min="0"></label>
+    <label>Book <input type="text" id="algo-book" size="10" value="default"></label>
     <label>Live <input type="checkbox" id="algo-live"></label>
     <button id="algo-submit" type="button">Start algo</button>
   </div>
@@ -195,6 +217,7 @@
     <h2 id="m-title">New order</h2>
     <div class="fld"><span>Symbol</span><input type="text" id="m-symbol" readonly></div>
     <div class="fld"><span>Side</span><input type="text" id="m-side" readonly></div>
+    <div class="fld"><span>Book</span><input type="text" id="m-book" value="default"></div>
     <div class="fld"><span>Type</span>
       <span>
         <label><input type="radio" name="m-type" value="market"> market</label>
@@ -225,7 +248,7 @@
   "use strict";
   var TABS = ["escalator", "activity", "summary", "algos"];
   var ACTIVE = { "new": 1, "accepted": 1, "pending_new": 1, "partially_filled": 1, "pending_cancel": 1, "pending_replace": 1 };
-  var state = { tab: "escalator", poll: null, symbol: "", expanded: {}, details: {}, strategies: [] };
+  var state = { tab: "escalator", poll: null, symbol: "", book: "default", expanded: {}, details: {}, strategies: [] };
 
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) {
@@ -389,18 +412,55 @@
       if (sym !== state.symbol) return;
       renderLadder(res.data && typeof res.data === "object" ? res.data : {});
     });
+    api("GET", "/api/cross/book/" + encodeURIComponent(sym)).then(function (res) {
+      if (sym !== state.symbol) return;
+      renderIBook(res.data && typeof res.data === "object" ? res.data : {});
+    });
+  }
+  function renderIBookSide(node, rows, side) {
+    clear(node);
+    rows = Array.isArray(rows) ? rows.filter(function (x) { return x; }) : [];
+    if (!rows.length) { node.className = "muted"; node.textContent = "no resting interest"; return; }
+    node.className = "";
+    var t = el("table"), th = el("thead"), h = el("tr");
+    ["price", "qty", "book", "age"].forEach(function (c) { h.appendChild(el("th", "", c)); });
+    th.appendChild(h); t.appendChild(th);
+    var tb = el("tbody");
+    rows.forEach(function (r) {
+      var tr = el("tr", side);
+      var p = num(r.price);
+      tr.appendChild(td(p === null || p >= 1e12 || p <= 0 ? "mkt" : fmtPx(p), "num"));
+      tr.appendChild(td(fmtQty(r.qty), "num"));
+      tr.appendChild(td(str(r.book)));
+      var age = num(r.age_s);
+      tr.appendChild(td(age === null ? "" : age.toFixed(1) + "s", "num", str(r.client_order_id)));
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); node.appendChild(t);
+  }
+  function renderIBook(d) {
+    d = d || {};
+    renderIBookSide($("ibook-bids"), d.bids, "buy");
+    renderIBookSide($("ibook-asks"), d.asks, "sell");
+  }
+  function venueBadge(v) {
+    var c = el("td"); var s = str(v);
+    if (s) c.appendChild(el("span", "badge " + (s === "internal" ? "internal" : "alpaca"), s));
+    return c;
   }
 
   /* ---------- activity ---------- */
   function renderOrders(rows) {
     var tb = $("orders-table").tBodies[0]; clear(tb);
-    if (!rows.length) { placeholderRow(tb, 15, "no orders"); return; }
+    if (!rows.length) { placeholderRow(tb, 17, "no orders"); return; }
     rows.forEach(function (o) {
       if (!o) return;
       var tr = el("tr");
       tr.appendChild(td(fmtTs(o.submitted_at)));
-      tr.appendChild(td(short(o.order_id, 8), "", str(o.order_id) + (o.client_order_id ? " / " + o.client_order_id : "")));
+      tr.appendChild(td(short(o.order_id, 8), "", str(o.order_id) + (o.client_order_id ? " / " + o.client_order_id : "") + (o.routed_order_id ? " -> " + o.routed_order_id : "")));
       tr.appendChild(td(str(o.account)));
+      tr.appendChild(td(str(o.book)));
+      tr.appendChild(venueBadge(o.venue));
       tr.appendChild(td(str(o.symbol)));
       tr.appendChild(td(str(o.side), o.side === "buy" ? "buy" : o.side === "sell" ? "sell" : ""));
       tr.appendChild(td(str(o.type)));
@@ -433,29 +493,32 @@
   }
   function renderFills(rows) {
     var tb = $("fills-table").tBodies[0]; clear(tb);
-    if (!rows.length) { placeholderRow(tb, 9, "no fills"); return; }
+    if (!rows.length) { placeholderRow(tb, 11, "no fills"); return; }
     rows.forEach(function (f) {
       if (!f) return;
       var tr = el("tr");
       tr.appendChild(td(fmtTs(f.ts)));
       tr.appendChild(td(short(f.order_id, 8), "", str(f.order_id)));
+      tr.appendChild(venueBadge(f.venue));
+      tr.appendChild(td(str(f.book)));
       tr.appendChild(td(str(f.symbol)));
       tr.appendChild(td(str(f.side), f.side === "buy" ? "buy" : f.side === "sell" ? "sell" : ""));
       tr.appendChild(td(fmtQty(f.qty), "num"));
       tr.appendChild(td(fmt2(f.price), "num"));
       tr.appendChild(td(fmt2(mul(f.qty, f.price)), "num"));
-      tr.appendChild(td(str(f.event)));
+      tr.appendChild(td(f.event === "internal_fill" ? "cross" : str(f.event), "", f.cross_id ? "cross " + str(f.cross_id) : ""));
       tr.appendChild(td(short(f.algo_id, 8), "", str(f.algo_id)));
       tb.appendChild(tr);
     });
   }
   function pollActivity() {
-    var q = "?limit=200&status=" + encodeURIComponent($("act-status").value) + "&account=" + encodeURIComponent($("act-account").value);
+    var venue = encodeURIComponent($("act-venue").value);
+    var q = "?limit=200&status=" + encodeURIComponent($("act-status").value) + "&account=" + encodeURIComponent($("act-account").value) + "&venue=" + venue;
     api("GET", "/api/orders" + q).then(function (res) {
       renderOrders(Array.isArray(res.data) ? res.data : []);
       $("act-msg").textContent = res.ok ? "" : "orders unavailable" + (res.data && res.data.error ? ": " + res.data.error : "");
     });
-    api("GET", "/api/fills?limit=200").then(function (res) {
+    api("GET", "/api/fills?limit=200&venue=" + venue).then(function (res) {
       renderFills(Array.isArray(res.data) ? res.data : []);
     });
   }
@@ -509,6 +572,30 @@
         var b = td(fmt2(total), "num " + (total >= 0 ? "buy" : "sell")); b.style.fontWeight = "600"; tr.appendChild(b);
         pt.appendChild(tr);
       }
+      var cx = d.crossing && typeof d.crossing === "object" ? d.crossing : {};
+      var cg = $("cross-grid"); clear(cg);
+      [["crosses", "crosses", fmtQty], ["crossed qty", "crossed_qty", fmtQty], ["crossed notional $", "crossed_notional", fmt2],
+       ["est. fee saved $", "est_fee_saved", fmt2], ["est. spread saved $", "est_spread_saved", fmt2],
+       ["routed orders", "routed_orders", fmtQty]].forEach(function (c) {
+        var card = el("div", "card");
+        card.appendChild(el("div", "k", c[0]));
+        var v = c[2](cx[c[1]]);
+        card.appendChild(el("div", "v", v === "" ? "0" : v));
+        cg.appendChild(card);
+      });
+      var bt = $("book-pos-table").tBodies[0]; clear(bt);
+      var bp = Array.isArray(d.positions_by_book) ? d.positions_by_book.filter(function (x) { return x; }) : [];
+      if (!bp.length) placeholderRow(bt, 5, "no book positions");
+      bp.forEach(function (p) {
+        var tr = el("tr");
+        tr.appendChild(td(str(p.book)));
+        tr.appendChild(td(str(p.symbol)));
+        var q = num(p.qty);
+        tr.appendChild(td(fmtQty(q), "num " + (q === null ? "" : q >= 0 ? "buy" : "sell")));
+        tr.appendChild(td(fmtQty(p.buy_qty), "num"));
+        tr.appendChild(td(fmtQty(p.sell_qty), "num"));
+        bt.appendChild(tr);
+      });
     });
   }
 
@@ -554,7 +641,8 @@
     if (n === null || n < 1) { toast("slices must be >= 1", false); return; }
     var cap = num($("algo-cap").value);
     var body = { strategy: $("algo-strategy").value || "twap", symbol: sym, side: $("algo-side").value,
-      total_qty: qty, duration_s: Math.round(dur), n_slices: Math.round(n), live: $("algo-live").checked, params: {} };
+      total_qty: qty, duration_s: Math.round(dur), n_slices: Math.round(n), live: $("algo-live").checked, params: {},
+      book: $("algo-book").value.trim() || "default" };
     if (cap !== null && cap > 0) body.limit_cap = cap;
     submitAlgo(body, null);
   }
@@ -690,6 +778,7 @@
     for (var i = 0; i < radios.length; i++) radios[i].checked = radios[i].value === "limit";
     $("m-tif").value = "gtc";
     $("m-live").checked = false;
+    $("m-book").value = state.book || "default";
     syncModalType();
     $("modal-back").classList.add("open");
     setTimeout(function () { $("m-qty").focus(); }, 0);
@@ -702,6 +791,8 @@
     var t = modalType(), sym = $("m-symbol").value, side = $("m-side").value;
     var qty = num($("m-qty").value), live = $("m-live").checked;
     if (qty === null || qty <= 0) { toast("qty must be > 0", false); return; }
+    var book = $("m-book").value.trim() || "default";
+    state.book = book;
     var after = function (good) {
       modalBusy = false; $("m-submit").disabled = false;
       if (good) { closeModal(); pollActivity(); pollAlgos(); }
@@ -710,14 +801,14 @@
       var dur = num($("m-duration").value), n = num($("m-slices").value), cap = num($("m-cap").value);
       if (dur === null || dur <= 0 || n === null || n < 1) { toast("duration and slices must be positive", false); return; }
       var ab = { strategy: "twap", symbol: sym, side: side, total_qty: qty, duration_s: Math.round(dur),
-        n_slices: Math.round(n), live: live, params: {} };
+        n_slices: Math.round(n), live: live, params: {}, book: book };
       if (cap !== null && cap > 0) ab.limit_cap = cap;
       if (live && !confirm("Submit LIVE TWAP: " + side + " " + qty + " " + sym + "?")) return;
       modalBusy = true; $("m-submit").disabled = true;
       api("POST", "/api/algo", ab).then(function (res) { after(replyToast(res, "algo")); });
       return;
     }
-    var body = { symbol: sym, qty: qty, side: side, type: t, tif: $("m-tif").value, live: live };
+    var body = { symbol: sym, qty: qty, side: side, type: t, tif: $("m-tif").value, live: live, book: book };
     if (t === "limit") {
       var lp = num($("m-limit").value);
       if (lp === null || lp <= 0) { toast("limit price must be > 0", false); return; }
@@ -739,6 +830,7 @@
   $("act-refresh").addEventListener("click", pollActivity);
   $("act-status").addEventListener("change", pollActivity);
   $("act-account").addEventListener("change", pollActivity);
+  $("act-venue").addEventListener("change", pollActivity);
   $("sum-refresh").addEventListener("click", pollSummary);
   $("sum-live").addEventListener("change", pollSummary);
   $("algo-refresh").addEventListener("click", pollAlgos);
